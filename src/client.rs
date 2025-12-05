@@ -589,7 +589,7 @@ impl<S> StreamWrapper<S> {
 
 impl<S: AsyncRead + Unpin> AsyncRead for StreamWrapper<S> {
     fn poll_read(
-        mut self: std::pin::Pin<&mut Self>,
+        self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<io::Result<()>> {
