@@ -1,0 +1,47 @@
+[package]
+name = "shadow-tls-tokio"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "A tokio-based implementation of ShadowTLS protocol"
+repository = "https://github.com/user/shadow-tls-tokio"
+
+[lib]
+name = "shadow_tls"
+path = "src/lib.rs"
+
+[[bin]]
+name = "shadow-tls-client"
+path = "src/bin/client.rs"
+
+[[bin]]
+name = "shadow-tls-server"
+path = "src/bin/server.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# TLS - using shadow-tls fork with session ID generation hook
+tokio-rustls-fork-shadow-tls = "0.0.8"
+rustls-fork-shadow-tls = { version = "0.20.8", default-features = false }
+webpki-roots = "0.22"
+
+# Crypto
+hmac = "0.12"
+sha1 = "0.10"
+sha2 = "0.10"
+
+# Utilities
+byteorder = "1"
+rand = "0.8"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+pin-project-lite = "0.2"
+bytes = "1"
+
+[dev-dependencies]
+tokio-test = "0.4"
