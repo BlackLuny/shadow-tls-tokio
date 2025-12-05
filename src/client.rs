@@ -161,6 +161,11 @@ impl ShadowTlsClient {
         &self.target_addr
     }
 
+    /// Get the SNI name.
+    pub fn get_sni(&self) -> &ServerName {
+        self.tls_names.random_choose()
+    }
+
     /// Relay a connection through ShadowTLS using a pre-established server connection.
     ///
     /// This is the main entry point for relaying data. It handles the TLS handshake

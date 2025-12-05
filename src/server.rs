@@ -190,7 +190,7 @@ impl ShadowTlsServer {
     /// * `client_stream` - The incoming client connection
     /// * `handshake_connector` - A function to connect to the handshake server
     /// * `data_connector` - A function to connect to the data server
-    pub async fn relay<S, HC, DC, HS, DS>(
+    pub async fn relay<S, HC, DC, HS, DS, HIO, DIO>(
         &self,
         client_stream: S,
         handshake_connector: HC,
@@ -200,8 +200,10 @@ impl ShadowTlsServer {
         S: AsyncRead + AsyncWrite + Unpin + Send,
         HC: FnOnce(String) -> HS,
         DC: FnOnce() -> DS,
-        HS: std::future::Future<Output = io::Result<tokio::net::TcpStream>>,
-        DS: std::future::Future<Output = io::Result<tokio::net::TcpStream>>,
+        HIO: AsyncRead + AsyncWrite + Unpin + Send,
+        DIO: AsyncRead + AsyncWrite + Unpin + Send,
+        HS: std::future::Future<Output = io::Result<HIO>>,
+        DS: std::future::Future<Output = io::Result<DIO>>,
     {
         if self.v3.enabled() {
             self.relay_v3(client_stream, handshake_connector, data_connector)
@@ -215,7 +217,7 @@ impl ShadowTlsServer {
     }
 
     /// Relay using V3 protocol.
-    async fn relay_v3<S, HC, DC, HS, DS>(
+    async fn relay_v3<S, HC, DC, HS, DS, HIO, DIO>(
         &self,
         mut client_stream: S,
         handshake_connector: HC,
@@ -225,8 +227,10 @@ impl ShadowTlsServer {
         S: AsyncRead + AsyncWrite + Unpin + Send,
         HC: FnOnce(String) -> HS,
         DC: FnOnce() -> DS,
-        HS: std::future::Future<Output = io::Result<tokio::net::TcpStream>>,
-        DS: std::future::Future<Output = io::Result<tokio::net::TcpStream>>,
+        HIO: AsyncRead + AsyncWrite + Unpin + Send,
+        DIO: AsyncRead + AsyncWrite + Unpin + Send,
+        HS: std::future::Future<Output = io::Result<HIO>>,
+        DS: std::future::Future<Output = io::Result<DIO>>,
     {
         tracing::debug!("starting V3 server relay");
 
@@ -242,7 +246,7 @@ impl ShadowTlsServer {
         tracing::debug!("connecting to handshake server: {}", handshake_addr);
 
         let mut handshake_stream = handshake_connector(handshake_addr.into_owned()).await?;
-        handshake_stream.set_nodelay(true)?;
+        // handshake_stream.set_nodelay(true)?;
 
         // Forward ClientHello to handshake server
         handshake_stream.write_all(&first_client_frame).await?;
@@ -299,7 +303,7 @@ impl ShadowTlsServer {
 
         // Stage 2: Connect to data server and relay
         let mut data_stream = data_connector().await?;
-        data_stream.set_nodelay(true)?;
+        // data_stream.set_nodelay(true)?;
 
         // Send the initial pure data
         data_stream.write_all(&pure_data).await?;
