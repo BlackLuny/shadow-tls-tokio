@@ -282,7 +282,7 @@ impl ShadowTlsServer {
         let key = kdf(&self.password, &server_random);
 
         // Relay handshake until we get authenticated data from client
-        let pure_data = relay_handshake(
+        let (pure_data, hmac_sr_c) = relay_handshake(
             &mut client_stream,
             &mut handshake_stream,
             &mut hmac_sr_c,
@@ -416,7 +416,7 @@ impl ShadowTlsServer {
         let key = kdf(&self.password, &server_random);
 
         // Relay handshake until we get authenticated data from client
-        let pure_data = relay_handshake(
+        let (pure_data, hmac_sr_c) = relay_handshake(
             &mut client_stream,
             &mut handshake_stream,
             &mut hmac_sr_c,
@@ -548,13 +548,14 @@ fn cursor_skip<T: AsRef<[u8]>>(cursor: &mut Cursor<T>, n: usize) -> io::Result<(
 }
 
 /// Relay handshake between client and handshake server.
+/// Returns (pure_data, updated_hmac_c) where updated_hmac_c is the HMAC state after processing.
 async fn relay_handshake<C, H>(
     client: &mut C,
     handshake: &mut H,
     hmac_c: &mut Hmac,
     hmac_sr: &mut Hmac,
     key: &[u8],
-) -> io::Result<Vec<u8>>
+) -> io::Result<(Vec<u8>, Hmac)>
 where
     C: AsyncRead + AsyncWrite + Unpin,
     H: AsyncRead + AsyncWrite + Unpin,
@@ -563,13 +564,14 @@ where
     let (mut h_read, mut h_write) = tokio::io::split(handshake);
 
     // Use channels to coordinate between the two copy tasks
-    let (tx, mut rx) = tokio::sync::oneshot::channel::<Vec<u8>>();
+    let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
     let mut tx = Some(tx);
 
     let hmac_c_clone = hmac_c.to_owned();
     let key_clone = key.to_vec();
 
     // Copy client -> handshake until HMAC matches
+    // Returns (pure_data, updated_hmac)
     let client_to_handshake = async {
         let mut hmac = hmac_c_clone;
         loop {
@@ -585,7 +587,8 @@ where
                     // HMAC matches! Update state and return pure data
                     hmac.update(&frame[TLS_HMAC_HEADER_SIZE..]);
                     hmac.update(&frame[TLS_HEADER_SIZE..TLS_HMAC_HEADER_SIZE]);
-                    return Ok::<_, io::Error>(frame[TLS_HMAC_HEADER_SIZE..].to_vec());
+                    let pure_data = frame[TLS_HMAC_HEADER_SIZE..].to_vec();
+                    return Ok::<_, io::Error>((pure_data, hmac));
                 }
             }
 
@@ -631,12 +634,12 @@ where
 
     tokio::select! {
         result = client_to_handshake => {
-            let pure_data = result?;
+            let (pure_data, updated_hmac) = result?;
             // Signal the other task to stop
             if let Some(tx) = tx.take() {
-                let _ = tx.send(Vec::new());
+                let _ = tx.send(());
             }
-            Ok(pure_data)
+            Ok((pure_data, updated_hmac))
         }
         result = handshake_to_client => {
             result?;
@@ -724,6 +727,7 @@ where
         frame.extend_from_slice(&buffer[..n]);
 
         write.write_all(&frame).await?;
+        write.flush().await?;
     }
 }
 
@@ -779,6 +783,7 @@ where
 
                 // Write the data without the header
                 write.write_all(&buffer[TLS_HMAC_HEADER_SIZE..]).await?;
+                write.flush().await?;
             }
             _ => {
                 tracing::debug!("unexpected frame type: {}", frame_type);
