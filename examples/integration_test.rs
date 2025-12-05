@@ -16,7 +16,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Barrier;
 
-const PASSWORD: &str = "test-password-12345";
+const PASSWORD: &str = "123xxx";
 const SNI: &str = "www.runit.com";
 const NUM_ROUNDS: usize = 10;
 
@@ -26,7 +26,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive(tracing::Level::INFO.into()),
+                .add_directive(tracing::Level::DEBUG.into()),
         )
         .init();
 
@@ -61,7 +61,8 @@ async fn main() -> anyhow::Result<()> {
                                         String::from_utf8_lossy(&buf[..n])
                                     );
                                     // Echo back with prefix
-                                    let response = format!("ECHO: {}", String::from_utf8_lossy(&buf[..n]));
+                                    let response =
+                                        format!("ECHO: {}", String::from_utf8_lossy(&buf[..n]));
                                     if let Err(e) = stream.write_all(response.as_bytes()).await {
                                         println!("[Echo] Write error: {}", e);
                                         break;
@@ -91,7 +92,7 @@ async fn main() -> anyhow::Result<()> {
     let server_addr = server_listener.local_addr()?;
     println!("ShadowTLS server listening on {}", server_addr);
 
-    // TLS address format: "sni:hostname:port;fallback" 
+    // TLS address format: "sni:hostname:port;fallback"
     // We use www.runit.com as the SNI, pointing to the real TLS server
     // Format: "sni:target_host:port;fallback_host:port"
     let tls_addr_str = format!("{}:www.runit.com:443;www.runit.com:443", SNI);
@@ -102,7 +103,7 @@ async fn main() -> anyhow::Result<()> {
         echo_addr.to_string(),
         tls_addr,
         PASSWORD.to_string(),
-        V3Mode::Lossy, // Use Lossy mode for compatibility
+        V3Mode::Strict, // Use Lossy mode for compatibility
     );
 
     let server_handle = tokio::spawn({
@@ -121,11 +122,17 @@ async fn main() -> anyhow::Result<()> {
                                 .relay(
                                     stream,
                                     |handshake_addr| async move {
-                                        println!("[Server] Connecting to handshake server: {}", handshake_addr);
+                                        println!(
+                                            "[Server] Connecting to handshake server: {}",
+                                            handshake_addr
+                                        );
                                         TcpStream::connect(handshake_addr).await
                                     },
                                     || async move {
-                                        println!("[Server] Connecting to data server: {}", echo_addr_str);
+                                        println!(
+                                            "[Server] Connecting to data server: {}",
+                                            echo_addr_str
+                                        );
                                         TcpStream::connect(echo_addr_str).await
                                     },
                                 )
@@ -151,11 +158,11 @@ async fn main() -> anyhow::Result<()> {
     println!("\n--- Starting Client Test ---\n");
 
     let client = ShadowTlsClient::new(
-        server_addr.to_string(),
+        "dummy".to_string(),
         vec![SNI.to_string()],
         PASSWORD.to_string(),
         None,
-        V3Mode::Lossy,
+        V3Mode::Strict,
     )?;
 
     // Start a local listener for the client
@@ -204,7 +211,11 @@ async fn main() -> anyhow::Result<()> {
     for round in 1..=NUM_ROUNDS {
         println!("\n--- Round {} ---", round);
 
-        let request = format!("Request #{}: Hello from client at {:?}", round, std::time::Instant::now());
+        let request = format!(
+            "Request #{}: Hello from client at {:?}",
+            round,
+            std::time::Instant::now()
+        );
         println!("[Test] Sending: {}", request);
 
         // Send request
