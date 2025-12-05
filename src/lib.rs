@@ -38,6 +38,6 @@ mod protocol;
 mod server;
 mod stream;
 
-pub use client::{ShadowTlsClient, TlsExtConfig, TlsNames};
+pub use client::{ShadowTlsClient, ShadowTlsClientStream, TlsExtConfig, TlsNames};
 pub use protocol::V3Mode;
-pub use server::{ShadowTlsServer, TlsAddrs, WildcardSNI};
+pub use server::{ShadowTlsServer, ShadowTlsServerStream, TlsAddrs, WildcardSNI};

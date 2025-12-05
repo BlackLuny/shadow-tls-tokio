@@ -3,11 +3,13 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{self, Cursor, Read};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use byteorder::BigEndian;
 use rand::Rng;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use crate::crypto::{kdf, Hmac};
 use crate::protocol::*;
@@ -176,6 +178,133 @@ impl ShadowTlsServer {
     /// Get the target address.
     pub fn target_addr(&self) -> &str {
         &self.target_addr
+    }
+
+    /// Get the TLS address.
+    pub fn tls_addr(&self) -> &TlsAddrs {
+        &self.tls_addr
+    }
+
+    /// Accept a ShadowTLS client connection and return a wrapped stream.
+    ///
+    /// This method performs the TLS handshake with the handshake server and returns
+    /// a `ShadowTlsServerStream` that implements `AsyncRead` and `AsyncWrite`.
+    /// Data written to this stream will be automatically wrapped with ShadowTLS
+    /// protocol framing, and data read from it will be automatically unwrapped.
+    ///
+    /// # Type Parameters
+    /// * `S` - The client stream type
+    /// * `HC` - Handshake connector function type
+    /// * `HS` - Handshake future type
+    /// * `HIO` - Handshake IO type
+    ///
+    /// # Returns
+    /// A tuple of `(ShadowTlsServerStream, Vec<u8>)` where the Vec contains any
+    /// initial data that was received during the handshake phase.
+    pub async fn accept<S, HC, HS, HIO>(
+        &self,
+        mut client_stream: S,
+        handshake_connector: HC,
+    ) -> io::Result<(ShadowTlsServerStream<S>, Vec<u8>)>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send,
+        HC: FnOnce(String) -> HS,
+        HIO: AsyncRead + AsyncWrite + Unpin + Send,
+        HS: std::future::Future<Output = io::Result<HIO>>,
+    {
+        if !self.v3.enabled() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "V2 protocol not implemented in tokio version",
+            ));
+        }
+
+        tracing::debug!("starting V3 server accept");
+
+        // Stage 1.1: Read and validate ClientHello
+        let first_client_frame = read_tls_frame(&mut client_stream).await?;
+        let (client_hello_pass, sni) = verified_extract_sni(&first_client_frame, &self.password);
+
+        // Connect to handshake server
+        let server_name = sni.and_then(|s| String::from_utf8(s).ok());
+        let handshake_addr = self
+            .tls_addr
+            .find(server_name.as_deref(), client_hello_pass);
+        tracing::debug!("connecting to handshake server: {}", handshake_addr);
+
+        let mut handshake_stream = handshake_connector(handshake_addr.into_owned()).await?;
+
+        // Forward ClientHello to handshake server
+        handshake_stream.write_all(&first_client_frame).await?;
+
+        if !client_hello_pass {
+            // Client verification failed, work as SNI proxy
+            tracing::warn!("ClientHello verify failed, working as SNI proxy");
+            tokio::io::copy_bidirectional(&mut client_stream, &mut handshake_stream).await?;
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "client verification failed",
+            ));
+        }
+        tracing::debug!("ClientHello verify success");
+
+        // Stage 1.2: Read ServerHello and extract server random
+        let first_server_frame = read_tls_frame(&mut handshake_stream).await?;
+        client_stream.write_all(&first_server_frame).await?;
+
+        let server_random = match extract_server_random(&first_server_frame) {
+            Some(sr) => sr,
+            None => {
+                tracing::warn!("ServerRandom extract failed, copying bidirectional");
+                tokio::io::copy_bidirectional(&mut client_stream, &mut handshake_stream).await?;
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "failed to extract server random",
+                ));
+            }
+        };
+        tracing::debug!("ServerRandom extracted: {:?}", server_random);
+
+        let use_tls13 = support_tls13(&first_server_frame);
+        if self.v3.strict() && !use_tls13 {
+            tracing::error!("V3 strict mode and TLS 1.3 not supported");
+            tokio::io::copy_bidirectional(&mut client_stream, &mut handshake_stream).await?;
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "TLS 1.3 not supported in strict mode",
+            ));
+        }
+
+        // Stage 1.3: Create HMACs and relay handshake
+        let mut hmac_sr_c = Hmac::new(&self.password, (&server_random, b"C"));
+        let hmac_sr_s = Hmac::new(&self.password, (&server_random, b"S"));
+        let mut hmac_sr = Hmac::new(&self.password, (&server_random, &[]));
+        let key = kdf(&self.password, &server_random);
+
+        // Relay handshake until we get authenticated data from client
+        let pure_data = relay_handshake(
+            &mut client_stream,
+            &mut handshake_stream,
+            &mut hmac_sr_c,
+            &mut hmac_sr,
+            &key,
+        )
+        .await?;
+
+        tracing::debug!(
+            "handshake relay finished, got {} bytes of pure data",
+            pure_data.len()
+        );
+
+        // Create the wrapped stream
+        let stream = ShadowTlsServerStream::new(
+            client_stream,
+            hmac_sr_s,    // for writing (server -> client)
+            hmac_sr_c,    // for reading (client -> server)
+            !use_tls13,
+        );
+
+        Ok((stream, pure_data))
     }
 
     /// Relay a connection from a ShadowTLS client.
@@ -670,4 +799,316 @@ async fn send_alert<W: AsyncWrite + Unpin>(write: &mut W) -> io::Result<()> {
     buf[4] = (FULL_SIZE - TLS_HEADER_SIZE) as u8;
     rand::thread_rng().fill(&mut buf[TLS_HEADER_SIZE..]);
     write.write_all(&buf).await
+}
+
+/// A wrapped stream that implements AsyncRead/AsyncWrite for ShadowTLS server.
+///
+/// This stream handles the ShadowTLS V3 protocol automatically:
+/// - Writes are wrapped with TLS application data framing and HMAC (server -> client)
+/// - Reads unwrap TLS frames and verify HMAC (client -> server)
+///
+/// # Example
+/// ```ignore
+/// let server = ShadowTlsServer::new(...);
+/// let client_stream = listener.accept().await?;
+/// let (mut stream, initial_data) = server.accept(client_stream, |addr| {
+///     TcpStream::connect(addr)
+/// }).await?;
+///
+/// // Handle initial_data first if needed
+/// process(&initial_data);
+///
+/// // Now use stream like a normal async stream
+/// let mut buf = [0u8; 1024];
+/// let n = stream.read(&mut buf).await?;
+/// stream.write_all(b"response").await?;
+/// ```
+pub struct ShadowTlsServerStream<S> {
+    inner: S,
+    /// HMAC for adding to outgoing data (server -> client)
+    hmac_write: Hmac,
+    /// HMAC for verifying incoming data (client -> server)
+    hmac_read: Hmac,
+    /// Whether to send alert on close (TLS 1.2 mode)
+    alert_enabled: bool,
+
+    // Read state machine
+    read_state: ServerReadState,
+    read_frame_buf: Vec<u8>,
+    read_header_pos: usize,
+    read_body_to_read: usize,
+    read_body_pos: usize,
+    read_out_buf: Vec<u8>,
+    read_out_pos: usize,
+
+    // Write state
+    write_frame: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ServerReadState {
+    /// Reading TLS frame header
+    ReadingHeader,
+    /// Reading TLS frame body
+    ReadingBody,
+    /// Have data ready to output
+    HasData,
+    /// Stream closed
+    Closed,
+}
+
+impl<S> ShadowTlsServerStream<S> {
+    /// Create a new ShadowTlsServerStream.
+    fn new(inner: S, hmac_write: Hmac, hmac_read: Hmac, alert_enabled: bool) -> Self {
+        Self {
+            inner,
+            hmac_write,
+            hmac_read,
+            alert_enabled,
+            read_state: ServerReadState::ReadingHeader,
+            read_frame_buf: Vec::with_capacity(COPY_BUF_SIZE + TLS_HEADER_SIZE),
+            read_header_pos: 0,
+            read_body_to_read: 0,
+            read_body_pos: 0,
+            read_out_buf: Vec::new(),
+            read_out_pos: 0,
+            write_frame: Vec::with_capacity(COPY_BUF_SIZE + TLS_HMAC_HEADER_SIZE),
+        }
+    }
+
+    /// Get a reference to the inner stream.
+    pub fn get_ref(&self) -> &S {
+        &self.inner
+    }
+
+    /// Get a mutable reference to the inner stream.
+    pub fn get_mut(&mut self) -> &mut S {
+        &mut self.inner
+    }
+
+    /// Consume this stream and return the inner stream.
+    pub fn into_inner(self) -> S {
+        self.inner
+    }
+
+    /// Process a complete TLS frame and extract payload data.
+    /// Returns true if data was extracted and is ready to read.
+    fn process_read_frame(&mut self) -> bool {
+        let frame = &self.read_frame_buf[..TLS_HEADER_SIZE + self.read_body_to_read];
+        let frame_type = frame[0];
+
+        match frame_type {
+            ALERT => {
+                tracing::debug!("received alert, closing stream");
+                self.read_state = ServerReadState::Closed;
+                false
+            }
+            APPLICATION_DATA => {
+                if frame.len() < TLS_HMAC_HEADER_SIZE {
+                    tracing::debug!("application data too short");
+                    self.read_state = ServerReadState::Closed;
+                    return false;
+                }
+
+                // Verify HMAC
+                self.hmac_read.update(&frame[TLS_HMAC_HEADER_SIZE..]);
+                let hmac_real = self.hmac_read.finalize();
+                self.hmac_read.update(&hmac_real);
+
+                if frame[TLS_HEADER_SIZE..TLS_HMAC_HEADER_SIZE] == hmac_real {
+                    // Extract payload (skip TLS header + HMAC)
+                    self.read_out_buf.clear();
+                    self.read_out_buf
+                        .extend_from_slice(&frame[TLS_HMAC_HEADER_SIZE..]);
+                    self.read_out_pos = 0;
+                    self.read_state = ServerReadState::HasData;
+                    true
+                } else {
+                    tracing::debug!("HMAC verification failed");
+                    self.read_state = ServerReadState::Closed;
+                    false
+                }
+            }
+            _ => {
+                tracing::debug!("unexpected frame type: {}", frame_type);
+                self.read_state = ServerReadState::Closed;
+                false
+            }
+        }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for ShadowTlsServerStream<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+
+        loop {
+            match this.read_state {
+                ServerReadState::Closed => {
+                    return Poll::Ready(Ok(()));
+                }
+                ServerReadState::HasData => {
+                    // Return buffered data
+                    if this.read_out_pos < this.read_out_buf.len() {
+                        let to_copy =
+                            (this.read_out_buf.len() - this.read_out_pos).min(buf.remaining());
+                        buf.put_slice(
+                            &this.read_out_buf[this.read_out_pos..this.read_out_pos + to_copy],
+                        );
+                        this.read_out_pos += to_copy;
+                        if this.read_out_pos >= this.read_out_buf.len() {
+                            // All data consumed, read next frame
+                            this.read_state = ServerReadState::ReadingHeader;
+                            this.read_header_pos = 0;
+                        }
+                        return Poll::Ready(Ok(()));
+                    }
+                    // Should not reach here, but reset state
+                    this.read_state = ServerReadState::ReadingHeader;
+                    this.read_header_pos = 0;
+                }
+                ServerReadState::ReadingHeader => {
+                    // Read TLS frame header
+                    this.read_frame_buf.resize(TLS_HEADER_SIZE, 0);
+                    while this.read_header_pos < TLS_HEADER_SIZE {
+                        let start = this.read_header_pos;
+                        let mut temp_buf =
+                            ReadBuf::new(&mut this.read_frame_buf[start..TLS_HEADER_SIZE]);
+                        match Pin::new(&mut this.inner).poll_read(cx, &mut temp_buf) {
+                            Poll::Ready(Ok(())) => {
+                                let n = temp_buf.filled().len();
+                                if n == 0 {
+                                    this.read_state = ServerReadState::Closed;
+                                    return Poll::Ready(Ok(()));
+                                }
+                                this.read_header_pos += n;
+                            }
+                            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                            Poll::Pending => return Poll::Pending,
+                        }
+                    }
+                    // Header complete
+                    this.read_body_to_read = u16::from_be_bytes([
+                        this.read_frame_buf[3],
+                        this.read_frame_buf[4],
+                    ]) as usize;
+                    this.read_frame_buf
+                        .resize(TLS_HEADER_SIZE + this.read_body_to_read, 0);
+                    this.read_body_pos = 0;
+                    this.read_state = ServerReadState::ReadingBody;
+                }
+                ServerReadState::ReadingBody => {
+                    // Read TLS frame body
+                    let end = TLS_HEADER_SIZE + this.read_body_to_read;
+                    while TLS_HEADER_SIZE + this.read_body_pos < end {
+                        let start = TLS_HEADER_SIZE + this.read_body_pos;
+                        let mut temp_buf = ReadBuf::new(&mut this.read_frame_buf[start..end]);
+                        match Pin::new(&mut this.inner).poll_read(cx, &mut temp_buf) {
+                            Poll::Ready(Ok(())) => {
+                                let n = temp_buf.filled().len();
+                                if n == 0 {
+                                    this.read_state = ServerReadState::Closed;
+                                    return Poll::Ready(Ok(()));
+                                }
+                                this.read_body_pos += n;
+                            }
+                            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                            Poll::Pending => return Poll::Pending,
+                        }
+                    }
+                    // Frame complete, process it
+                    this.process_read_frame();
+                    // Loop continues to handle the new state
+                }
+            }
+        }
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for ShadowTlsServerStream<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+
+        let this = self.get_mut();
+
+        // Build the TLS application data frame with HMAC
+        this.write_frame.clear();
+        this.write_frame.push(APPLICATION_DATA);
+        this.write_frame.push(TLS_MAJOR);
+        this.write_frame.push(TLS_MINOR_TLS12);
+
+        let frame_len = HMAC_SIZE + buf.len();
+        this.write_frame
+            .extend_from_slice(&(frame_len as u16).to_be_bytes());
+
+        // Calculate and add HMAC
+        this.hmac_write.update(buf);
+        let hmac_val = this.hmac_write.finalize();
+        this.hmac_write.update(&hmac_val);
+        this.write_frame.extend_from_slice(&hmac_val);
+
+        // Add data
+        this.write_frame.extend_from_slice(buf);
+
+        // Write the entire frame
+        let mut written = 0;
+        while written < this.write_frame.len() {
+            match Pin::new(&mut this.inner).poll_write(cx, &this.write_frame[written..]) {
+                Poll::Ready(Ok(n)) => {
+                    if n == 0 {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "failed to write frame",
+                        )));
+                    }
+                    written += n;
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => {
+                    if written == 0 {
+                        return Poll::Pending;
+                    }
+                    continue;
+                }
+            }
+        }
+
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+
+        // Send TLS alert if enabled (TLS 1.2 mode)
+        if this.alert_enabled {
+            const FULL_SIZE: usize = 31;
+            let mut alert_buf = vec![0u8; FULL_SIZE];
+            alert_buf[0] = ALERT;
+            alert_buf[1] = TLS_MAJOR;
+            alert_buf[2] = TLS_MINOR_TLS12;
+            alert_buf[3] = 0x00;
+            alert_buf[4] = (FULL_SIZE - TLS_HEADER_SIZE) as u8;
+            rand::thread_rng().fill(&mut alert_buf[TLS_HEADER_SIZE..]);
+
+            // Try to write alert (best effort)
+            let _ = Pin::new(&mut this.inner).poll_write(cx, &alert_buf);
+            this.alert_enabled = false; // Only send once
+        }
+
+        Pin::new(&mut this.inner).poll_shutdown(cx)
+    }
 }
