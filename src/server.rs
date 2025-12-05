@@ -225,6 +225,8 @@ impl ShadowTlsServer {
         let first_client_frame = read_tls_frame(&mut client_stream).await?;
         let (client_hello_pass, sni) = verified_extract_sni(&first_client_frame, &self.password);
 
+        tracing::debug!("client_hello_pass: {}, sni: {:?}", client_hello_pass, sni);
+
         // Connect to handshake server
         let server_name = sni.and_then(|s| String::from_utf8(s).ok());
         let handshake_addr = self
@@ -234,8 +236,14 @@ impl ShadowTlsServer {
 
         let mut handshake_stream = handshake_connector(handshake_addr.into_owned()).await?;
 
+        tracing::debug!("connected to handshake server success",);
+
         // Forward ClientHello to handshake server
         handshake_stream.write_all(&first_client_frame).await?;
+
+        handshake_stream.flush().await?;
+
+        tracing::debug!("forwarded ClientHello to handshake server success",);
 
         if !client_hello_pass {
             // Client verification failed, work as SNI proxy
@@ -251,6 +259,7 @@ impl ShadowTlsServer {
         // Stage 1.2: Read ServerHello and extract server random
         let first_server_frame = read_tls_frame(&mut handshake_stream).await?;
         client_stream.write_all(&first_server_frame).await?;
+        client_stream.flush().await?;
 
         let server_random = match extract_server_random(&first_server_frame) {
             Some(sr) => sr,
@@ -299,8 +308,8 @@ impl ShadowTlsServer {
         // Create the wrapped stream
         let stream = ShadowTlsServerStream::new(
             client_stream,
-            hmac_sr_s,    // for writing (server -> client)
-            hmac_sr_c,    // for reading (client -> server)
+            hmac_sr_s, // for writing (server -> client)
+            hmac_sr_c, // for reading (client -> server)
             !use_tls13,
         );
 
@@ -367,6 +376,8 @@ impl ShadowTlsServer {
         let first_client_frame = read_tls_frame(&mut client_stream).await?;
         let (client_hello_pass, sni) = verified_extract_sni(&first_client_frame, &self.password);
 
+        tracing::debug!("client_hello_pass: {}, sni: {:?}", client_hello_pass, sni);
+
         // Connect to handshake server
         let server_name = sni.and_then(|s| String::from_utf8(s).ok());
         let handshake_addr = self
@@ -375,10 +386,12 @@ impl ShadowTlsServer {
         tracing::debug!("connecting to handshake server: {}", handshake_addr);
 
         let mut handshake_stream = handshake_connector(handshake_addr.into_owned()).await?;
-        // handshake_stream.set_nodelay(true)?;
+
+        tracing::debug!("connected to handshake server success",);
 
         // Forward ClientHello to handshake server
         handshake_stream.write_all(&first_client_frame).await?;
+        handshake_stream.flush().await?;
 
         if !client_hello_pass {
             // Client verification failed, work as SNI proxy
@@ -391,6 +404,7 @@ impl ShadowTlsServer {
         // Stage 1.2: Read ServerHello and extract server random
         let first_server_frame = read_tls_frame(&mut handshake_stream).await?;
         client_stream.write_all(&first_server_frame).await?;
+        client_stream.flush().await?;
 
         let server_random = match extract_server_random(&first_server_frame) {
             Some(sr) => sr,
@@ -436,6 +450,7 @@ impl ShadowTlsServer {
 
         // Send the initial pure data
         data_stream.write_all(&pure_data).await?;
+        data_stream.flush().await?;
 
         // Verified relay
         verified_relay(data_stream, client_stream, hmac_sr_s, hmac_sr_c, !use_tls13).await
@@ -594,6 +609,7 @@ where
 
             // Forward to handshake server
             h_write.write_all(&frame).await?;
+            h_write.flush().await?;
         }
     };
 
@@ -627,6 +643,7 @@ where
                     }
 
                     c_write.write_all(&frame).await?;
+                    c_write.flush().await?;
                 }
             }
         }
@@ -803,7 +820,8 @@ async fn send_alert<W: AsyncWrite + Unpin>(write: &mut W) -> io::Result<()> {
     buf[3] = 0x00;
     buf[4] = (FULL_SIZE - TLS_HEADER_SIZE) as u8;
     rand::thread_rng().fill(&mut buf[TLS_HEADER_SIZE..]);
-    write.write_all(&buf).await
+    write.write_all(&buf).await?;
+    write.flush().await
 }
 
 /// A wrapped stream that implements AsyncRead/AsyncWrite for ShadowTLS server.
@@ -997,10 +1015,9 @@ impl<S: AsyncRead + Unpin> AsyncRead for ShadowTlsServerStream<S> {
                         }
                     }
                     // Header complete
-                    this.read_body_to_read = u16::from_be_bytes([
-                        this.read_frame_buf[3],
-                        this.read_frame_buf[4],
-                    ]) as usize;
+                    this.read_body_to_read =
+                        u16::from_be_bytes([this.read_frame_buf[3], this.read_frame_buf[4]])
+                            as usize;
                     this.read_frame_buf
                         .resize(TLS_HEADER_SIZE + this.read_body_to_read, 0);
                     this.read_body_pos = 0;

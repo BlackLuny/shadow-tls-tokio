@@ -452,6 +452,7 @@ where
                 if verify_appdata(&buffer, hmac_verify, true) {
                     // Write the data without the header
                     write.write_all(&buffer[TLS_HMAC_HEADER_SIZE..]).await?;
+                    write.flush().await?;
                 } else {
                     tracing::debug!("HMAC verification failed");
                     return Ok(());
@@ -539,7 +540,8 @@ async fn send_alert<W: AsyncWrite + Unpin>(write: &mut W) -> io::Result<()> {
     buf[3] = 0x00;
     buf[4] = (FULL_SIZE - TLS_HEADER_SIZE) as u8;
     rand::thread_rng().fill(&mut buf[TLS_HEADER_SIZE..]);
-    write.write_all(&buf).await
+    write.write_all(&buf).await?;
+    write.flush().await
 }
 
 /// Stream wrapper for intercepting TLS handshake and extracting server random.
@@ -1015,10 +1017,9 @@ impl<S: AsyncRead + Unpin> AsyncRead for ShadowTlsClientStream<S> {
                         }
                     }
                     // Header complete
-                    this.read_body_to_read = u16::from_be_bytes([
-                        this.read_frame_buf[3],
-                        this.read_frame_buf[4],
-                    ]) as usize;
+                    this.read_body_to_read =
+                        u16::from_be_bytes([this.read_frame_buf[3], this.read_frame_buf[4]])
+                            as usize;
                     this.read_frame_buf
                         .resize(TLS_HEADER_SIZE + this.read_body_to_read, 0);
                     this.read_body_pos = 0;
