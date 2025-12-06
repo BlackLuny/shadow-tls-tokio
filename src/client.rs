@@ -849,8 +849,16 @@ pub struct ShadowTlsClientStream<S> {
     read_out_buf: Vec<u8>,
     read_out_pos: usize,
 
-    // Write state
+    // Write state machine
+    write_state: ClientWriteState,
     write_frame: Vec<u8>,
+    write_pos: usize,
+    write_user_data_len: usize,
+
+    // Shutdown state
+    shutdown_state: ClientShutdownState,
+    alert_buf: Option<Vec<u8>>,
+    alert_pos: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -863,6 +871,24 @@ enum ReadState {
     HasData,
     /// Stream closed
     Closed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ClientWriteState {
+    /// Ready to accept new data
+    Idle,
+    /// Writing a frame
+    Writing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ClientShutdownState {
+    /// Not started
+    NotStarted,
+    /// Sending alert
+    SendingAlert,
+    /// Alert sent, shutting down inner
+    ShuttingDown,
 }
 
 impl<S> ShadowTlsClientStream<S> {
@@ -887,7 +913,13 @@ impl<S> ShadowTlsClientStream<S> {
             read_body_pos: 0,
             read_out_buf: Vec::new(),
             read_out_pos: 0,
+            write_state: ClientWriteState::Idle,
             write_frame: Vec::with_capacity(COPY_BUF_SIZE + TLS_HMAC_HEADER_SIZE),
+            write_pos: 0,
+            write_user_data_len: 0,
+            shutdown_state: ClientShutdownState::NotStarted,
+            alert_buf: None,
+            alert_pos: 0,
         }
     }
 
@@ -1065,6 +1097,31 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for ShadowTlsClientStream<S> {
 
         let this = self.get_mut();
 
+        // If we're still writing a previous frame, finish it first
+        if this.write_state == ClientWriteState::Writing {
+            while this.write_pos < this.write_frame.len() {
+                match Pin::new(&mut this.inner).poll_write(cx, &this.write_frame[this.write_pos..]) {
+                    Poll::Ready(Ok(n)) => {
+                        if n == 0 {
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::WriteZero,
+                                "failed to write frame",
+                            )));
+                        }
+                        this.write_pos += n;
+                    }
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+            // Frame complete, reset state and return the bytes we already committed
+            let user_data_len = this.write_user_data_len;
+            this.write_state = ClientWriteState::Idle;
+            this.write_pos = 0;
+            this.write_user_data_len = 0;
+            return Poll::Ready(Ok(user_data_len));
+        }
+
         // Build the TLS application data frame with HMAC
         this.write_frame.clear();
         this.write_frame.push(APPLICATION_DATA);
@@ -1084,11 +1141,15 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for ShadowTlsClientStream<S> {
         // Add data
         this.write_frame.extend_from_slice(buf);
 
-        // Write the entire frame
-        // Note: We need to write the entire frame atomically
-        let mut written = 0;
-        while written < this.write_frame.len() {
-            match Pin::new(&mut this.inner).poll_write(cx, &this.write_frame[written..]) {
+        // Track how many user bytes this frame contains
+        this.write_user_data_len = buf.len();
+
+        // Write the frame
+        this.write_pos = 0;
+        this.write_state = ClientWriteState::Writing;
+
+        while this.write_pos < this.write_frame.len() {
+            match Pin::new(&mut this.inner).poll_write(cx, &this.write_frame[this.write_pos..]) {
                 Poll::Ready(Ok(n)) => {
                     if n == 0 {
                         return Poll::Ready(Err(io::Error::new(
@@ -1096,46 +1157,110 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for ShadowTlsClientStream<S> {
                             "failed to write frame",
                         )));
                     }
-                    written += n;
+                    this.write_pos += n;
                 }
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => {
-                    if written == 0 {
-                        return Poll::Pending;
-                    }
-                    // Partial write, continue in next poll
-                    // This is a simplification; in production you'd want to track partial writes
-                    continue;
-                }
+                Poll::Pending => return Poll::Pending,
             }
         }
 
+        // Frame complete
+        this.write_state = ClientWriteState::Idle;
+        this.write_pos = 0;
+        this.write_user_data_len = 0;
         Poll::Ready(Ok(buf.len()))
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+        let this = self.get_mut();
+
+        // First, finish any pending frame write
+        if this.write_state == ClientWriteState::Writing {
+            while this.write_pos < this.write_frame.len() {
+                match Pin::new(&mut this.inner).poll_write(cx, &this.write_frame[this.write_pos..]) {
+                    Poll::Ready(Ok(n)) => {
+                        if n == 0 {
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::WriteZero,
+                                "failed to write frame",
+                            )));
+                        }
+                        this.write_pos += n;
+                    }
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+            this.write_state = ClientWriteState::Idle;
+            this.write_pos = 0;
+            this.write_user_data_len = 0;
+        }
+
+        Pin::new(&mut this.inner).poll_flush(cx)
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
 
-        // Send TLS alert if enabled (TLS 1.2 mode)
-        if this.alert_enabled {
-            const FULL_SIZE: usize = 31;
-            let mut alert_buf = vec![0u8; FULL_SIZE];
-            alert_buf[0] = ALERT;
-            alert_buf[1] = TLS_MAJOR;
-            alert_buf[2] = TLS_MINOR_TLS12;
-            alert_buf[3] = 0x00;
-            alert_buf[4] = (FULL_SIZE - TLS_HEADER_SIZE) as u8;
-            rand::thread_rng().fill(&mut alert_buf[TLS_HEADER_SIZE..]);
+        loop {
+            match this.shutdown_state {
+                ClientShutdownState::NotStarted => {
+                    // First, flush any pending write
+                    if this.write_state == ClientWriteState::Writing {
+                        while this.write_pos < this.write_frame.len() {
+                            match Pin::new(&mut this.inner).poll_write(cx, &this.write_frame[this.write_pos..]) {
+                                Poll::Ready(Ok(n)) => {
+                                    if n == 0 {
+                                        break;
+                                    }
+                                    this.write_pos += n;
+                                }
+                                Poll::Ready(Err(_)) => break,
+                                Poll::Pending => return Poll::Pending,
+                            }
+                        }
+                        this.write_state = ClientWriteState::Idle;
+                    }
 
-            // Try to write alert (best effort)
-            let _ = Pin::new(&mut this.inner).poll_write(cx, &alert_buf);
-            this.alert_enabled = false; // Only send once
+                    if this.alert_enabled {
+                        const FULL_SIZE: usize = 31;
+                        let mut alert_buf = vec![0u8; FULL_SIZE];
+                        alert_buf[0] = ALERT;
+                        alert_buf[1] = TLS_MAJOR;
+                        alert_buf[2] = TLS_MINOR_TLS12;
+                        alert_buf[3] = 0x00;
+                        alert_buf[4] = (FULL_SIZE - TLS_HEADER_SIZE) as u8;
+                        rand::thread_rng().fill(&mut alert_buf[TLS_HEADER_SIZE..]);
+                        this.alert_buf = Some(alert_buf);
+                        this.alert_pos = 0;
+                        this.shutdown_state = ClientShutdownState::SendingAlert;
+                    } else {
+                        this.shutdown_state = ClientShutdownState::ShuttingDown;
+                    }
+                }
+                ClientShutdownState::SendingAlert => {
+                    if let Some(ref alert_buf) = this.alert_buf {
+                        while this.alert_pos < alert_buf.len() {
+                            match Pin::new(&mut this.inner).poll_write(cx, &alert_buf[this.alert_pos..]) {
+                                Poll::Ready(Ok(n)) => {
+                                    if n == 0 {
+                                        break;
+                                    }
+                                    this.alert_pos += n;
+                                }
+                                Poll::Ready(Err(_)) => break,
+                                Poll::Pending => return Poll::Pending,
+                            }
+                        }
+                    }
+                    this.alert_buf = None;
+                    this.alert_enabled = false;
+                    this.shutdown_state = ClientShutdownState::ShuttingDown;
+                }
+                ClientShutdownState::ShuttingDown => {
+                    return Pin::new(&mut this.inner).poll_shutdown(cx);
+                }
+            }
         }
-
-        Pin::new(&mut this.inner).poll_shutdown(cx)
     }
 }
