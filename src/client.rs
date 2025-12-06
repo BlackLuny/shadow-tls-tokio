@@ -853,7 +853,6 @@ pub struct ShadowTlsClientStream<S> {
     write_state: ClientWriteState,
     write_frame: Vec<u8>,
     write_pos: usize,
-    write_user_data_len: usize,
 
     // Shutdown state
     shutdown_state: ClientShutdownState,
@@ -916,7 +915,6 @@ impl<S> ShadowTlsClientStream<S> {
             write_state: ClientWriteState::Idle,
             write_frame: Vec::with_capacity(COPY_BUF_SIZE + TLS_HMAC_HEADER_SIZE),
             write_pos: 0,
-            write_user_data_len: 0,
             shutdown_state: ClientShutdownState::NotStarted,
             alert_buf: None,
             alert_pos: 0,
@@ -1115,11 +1113,9 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for ShadowTlsClientStream<S> {
                 }
             }
             // Frame complete, reset state and return the bytes we already committed
-            let user_data_len = this.write_user_data_len;
             this.write_state = ClientWriteState::Idle;
             this.write_pos = 0;
-            this.write_user_data_len = 0;
-            return Poll::Ready(Ok(user_data_len));
+            return Poll::Ready(Ok(buf.len()));
         }
 
         // Build the TLS application data frame with HMAC
@@ -1140,9 +1136,6 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for ShadowTlsClientStream<S> {
 
         // Add data
         this.write_frame.extend_from_slice(buf);
-
-        // Track how many user bytes this frame contains
-        this.write_user_data_len = buf.len();
 
         // Write the frame
         this.write_pos = 0;
@@ -1167,7 +1160,6 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for ShadowTlsClientStream<S> {
         // Frame complete
         this.write_state = ClientWriteState::Idle;
         this.write_pos = 0;
-        this.write_user_data_len = 0;
         Poll::Ready(Ok(buf.len()))
     }
 
@@ -1193,7 +1185,6 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for ShadowTlsClientStream<S> {
             }
             this.write_state = ClientWriteState::Idle;
             this.write_pos = 0;
-            this.write_user_data_len = 0;
         }
 
         Pin::new(&mut this.inner).poll_flush(cx)
