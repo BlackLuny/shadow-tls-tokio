@@ -564,6 +564,8 @@ pub struct StreamWrapper<S> {
     // Reading state machine
     header_read: usize,
     body_to_read: usize,
+    // Write-side: track pending flush since upstream never calls poll_flush
+    need_flush: bool,
 }
 
 #[derive(Clone)]
@@ -587,6 +589,7 @@ impl<S> StreamWrapper<S> {
             tls13: false,
             header_read: 0,
             body_to_read: 0,
+            need_flush: false,
         }
     }
 
@@ -765,17 +768,58 @@ impl<S: AsyncRead + Unpin> AsyncRead for StreamWrapper<S> {
 
 impl<S: AsyncWrite + Unpin> AsyncWrite for StreamWrapper<S> {
     fn poll_write(
-        mut self: std::pin::Pin<&mut Self>,
+        self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<io::Result<usize>> {
-        std::pin::Pin::new(&mut self.raw).poll_write(cx, buf)
+        use std::pin::Pin;
+        use std::task::Poll;
+        let this = self.get_mut();
+
+        // Complete any pending flush before accepting new writes.
+        // This prevents deadlock: if a previous poll_flush returned Pending,
+        // the waker will re-poll the task, and upstream will call poll_write
+        // (since it has more handshake data or retries). We must finish the
+        // flush here, otherwise data stays stuck in the buffer forever.
+        if this.need_flush {
+            match Pin::new(&mut this.raw).poll_flush(cx) {
+                Poll::Ready(Ok(())) => {
+                    this.need_flush = false;
+                }
+                Poll::Ready(Err(e)) => {
+                    this.need_flush = false;
+                    return Poll::Ready(Err(e));
+                }
+                Poll::Pending => {
+                    return Poll::Pending;
+                }
+            }
+        }
+
+        match Pin::new(&mut this.raw).poll_write(cx, buf) {
+            Poll::Ready(Ok(n)) => {
+                // Upstream crate never calls poll_flush, so we flush after
+                // every write to ensure handshake data is sent immediately.
+                match Pin::new(&mut this.raw).poll_flush(cx) {
+                    Poll::Ready(Ok(())) => {}
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => {
+                        // Flush not complete yet — mark it so the next
+                        // poll_write will finish flushing before writing.
+                        this.need_flush = true;
+                    }
+                }
+                Poll::Ready(Ok(n))
+            }
+            other => other,
+        }
     }
 
     fn poll_flush(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<io::Result<()>> {
+        self.need_flush = false;
         std::pin::Pin::new(&mut self.raw).poll_flush(cx)
     }
 
@@ -1098,7 +1142,8 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for ShadowTlsClientStream<S> {
         // If we're still writing a previous frame, finish it first
         if this.write_state == ClientWriteState::Writing {
             while this.write_pos < this.write_frame.len() {
-                match Pin::new(&mut this.inner).poll_write(cx, &this.write_frame[this.write_pos..]) {
+                match Pin::new(&mut this.inner).poll_write(cx, &this.write_frame[this.write_pos..])
+                {
                     Poll::Ready(Ok(n)) => {
                         if n == 0 {
                             return Poll::Ready(Err(io::Error::new(
@@ -1169,7 +1214,8 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for ShadowTlsClientStream<S> {
         // First, finish any pending frame write
         if this.write_state == ClientWriteState::Writing {
             while this.write_pos < this.write_frame.len() {
-                match Pin::new(&mut this.inner).poll_write(cx, &this.write_frame[this.write_pos..]) {
+                match Pin::new(&mut this.inner).poll_write(cx, &this.write_frame[this.write_pos..])
+                {
                     Poll::Ready(Ok(n)) => {
                         if n == 0 {
                             return Poll::Ready(Err(io::Error::new(
@@ -1199,7 +1245,9 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for ShadowTlsClientStream<S> {
                     // First, flush any pending write
                     if this.write_state == ClientWriteState::Writing {
                         while this.write_pos < this.write_frame.len() {
-                            match Pin::new(&mut this.inner).poll_write(cx, &this.write_frame[this.write_pos..]) {
+                            match Pin::new(&mut this.inner)
+                                .poll_write(cx, &this.write_frame[this.write_pos..])
+                            {
                                 Poll::Ready(Ok(n)) => {
                                     if n == 0 {
                                         break;
@@ -1232,7 +1280,9 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for ShadowTlsClientStream<S> {
                 ClientShutdownState::SendingAlert => {
                     if let Some(ref alert_buf) = this.alert_buf {
                         while this.alert_pos < alert_buf.len() {
-                            match Pin::new(&mut this.inner).poll_write(cx, &alert_buf[this.alert_pos..]) {
+                            match Pin::new(&mut this.inner)
+                                .poll_write(cx, &alert_buf[this.alert_pos..])
+                            {
                                 Poll::Ready(Ok(n)) => {
                                     if n == 0 {
                                         break;
