@@ -211,7 +211,7 @@ impl ShadowTlsClient {
                 io::Error::new(io::ErrorKind::Other, format!("TLS handshake failed: {}", e))
             })?;
 
-        tracing::debug!("TLS handshake success");
+        tracing::trace!("TLS handshake success");
 
         // Get the inner wrapper back
         let (io, session) = tls_stream.into_parts();
@@ -239,7 +239,7 @@ impl ShadowTlsClient {
             io::Error::new(io::ErrorKind::Other, "failed to extract server random")
         })?;
 
-        tracing::debug!("Authorized, ServerRandom extracted: {:?}", server_random);
+        tracing::trace!("Authorized, ServerRandom extracted: {:?}", server_random);
 
         // Create HMAC instances for read/write
         let hmac_client = Hmac::new(&self.password, (&server_random, b"C"));
@@ -283,7 +283,7 @@ impl ShadowTlsClient {
         S: AsyncRead + AsyncWrite + Unpin + Send,
         T: AsyncRead + AsyncWrite + Unpin + Send,
     {
-        tracing::debug!("starting V3 relay");
+        tracing::trace!("starting V3 relay");
 
         // Stage 1: TLS handshake with custom session ID generator
         let sni = self.tls_names.random_choose().clone();
@@ -303,7 +303,7 @@ impl ShadowTlsClient {
                 io::Error::new(io::ErrorKind::Other, format!("TLS handshake failed: {}", e))
             })?;
 
-        tracing::debug!("TLS handshake success");
+        tracing::trace!("TLS handshake success");
 
         // Get the inner wrapper back
         let (io, session) = tls_stream.into_parts();
@@ -331,7 +331,7 @@ impl ShadowTlsClient {
             io::Error::new(io::ErrorKind::Other, "failed to extract server random")
         })?;
 
-        tracing::debug!("Authorized, ServerRandom extracted: {:?}", server_random);
+        tracing::trace!("Authorized, ServerRandom extracted: {:?}", server_random);
 
         // Stage 2: Verified relay
         let hmac_sr_s = Hmac::new(&self.password, (&server_random, b"S"));
