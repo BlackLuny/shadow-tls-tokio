@@ -9,7 +9,25 @@ A Tokio-based implementation of the [ShadowTLS](https://github.com/ihciah/shadow
 - **Tokio Runtime**: Built on Tokio for high-performance async I/O
 - **Generic I/O**: Works with any `AsyncRead + AsyncWrite` stream, not just TCP
 - **Compatible**: Designed to be compatible with the original shadow-tls implementation
-- **Library + Binaries**: Can be used as a library in your own projects or as standalone binaries
+- **Library + Binaries**: Can be used as a library in your own projects or as standalone binaries (binaries need `--features bin`)
+
+## Cargo features
+
+| Feature | Default | What it pulls in |
+|---|---|---|
+| `client` | yes | The ShadowTLS **client** half. It is the only user of `rustls-fork-shadow-tls` — a rustls **0.20** fork, the sole published rustls exposing the ClientHello `session_id` generation hook V3 needs. It therefore drags in the legacy `ring 0.16` / `webpki 0.22` / `sct` stack. |
+| `cli` | **no** | CLI plumbing shared by the binaries (`clap` + `tracing-subscriber`). |
+| `bin-server` | **no** | `shadow-tls-server`. Implies `cli` only — building just the server CLI stays free of the rustls 0.20 fork. |
+| `bin-client` | **no** | `shadow-tls-client`. Implies `cli` + `client`. |
+| `bin` | **no** | Both binaries. |
+
+Server-only consumers should set `default-features = false` to keep the legacy TLS
+stack out of their dependency graph entirely.
+
+`bin` is off by default so that library consumers do not compile `clap` and
+`tracing-subscriber`. Both `[[bin]]` targets declare `required-features = ["bin"]`,
+which means **a plain `cargo build` silently produces no binaries** — pass
+`--features bin` (or the narrower `bin-server` / `bin-client`; see below).
 
 ## Installation
 
@@ -17,7 +35,11 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
+# Client + server.
 shadow-tls-tokio = { git = "https://github.com/user/shadow-tls-tokio" }
+
+# Server only — drops the rustls 0.20 fork / ring 0.16.
+shadow-tls-tokio = { git = "https://github.com/user/shadow-tls-tokio", default-features = false }
 ```
 
 ## Usage
@@ -90,7 +112,7 @@ async fn main() -> anyhow::Result<()> {
 
 ```bash
 # Build
-cargo build --release --bin shadow-tls-client
+cargo build --release --features bin-client --bin shadow-tls-client
 
 # Run
 ./target/release/shadow-tls-client \
@@ -105,7 +127,7 @@ cargo build --release --bin shadow-tls-client
 
 ```bash
 # Build
-cargo build --release --bin shadow-tls-server
+cargo build --release --features bin-server --bin shadow-tls-server
 
 # Run
 ./target/release/shadow-tls-server \

@@ -13,33 +13,65 @@ path = "src/lib.rs"
 [[bin]]
 name = "shadow-tls-client"
 path = "src/bin/client.rs"
+required-features = ["bin-client"]
 
 [[bin]]
 name = "shadow-tls-server"
 path = "src/bin/server.rs"
+required-features = ["bin-server"]
+
+[features]
+default = ["client"]
+# ShadowTLS **client** side. Kept behind a feature because it is the only thing in
+# this crate that needs `rustls-fork-shadow-tls` — a rustls **0.20** fork, the sole
+# published rustls build exposing the ClientHello `session_id` generation hook that
+# ShadowTLS v3 requires. That fork drags in ring 0.16 / webpki 0.22 / sct alongside
+# the modern rustls 0.23 stack the rest of the dependency graph uses. Server-only
+# consumers (e.g. zfc's inbound ShadowTLS) should set `default-features = false`.
+client = [
+    "dep:rustls-fork-shadow-tls",
+    "dep:tokio-rustls-fork-shadow-tls",
+    "dep:webpki-roots",
+    "tokio/net",
+]
+# CLI plumbing shared by both binaries. `clap` + `tracing-subscriber` are pure binary
+# concerns; library consumers must not pay for them (tracing-subscriber alone pulls
+# matchers/nu-ansi-term/sharded-slab/thread_local/regex-automata).
+cli = ["dep:clap", "dep:tracing-subscriber", "tokio/rt-multi-thread", "tokio/net"]
+# `shadow-tls-server` deliberately does NOT imply `client`: src/bin/server.rs only
+# touches the server half, so building just that binary stays free of the rustls 0.20
+# fork. `shadow-tls-client` of course needs it.
+bin-server = ["cli"]
+bin-client = ["cli", "client"]
+# Convenience: both binaries.
+bin = ["bin-client", "bin-server"]
 
 [dependencies]
-# Async runtime
-tokio = { version = "1", features = ["full"] }
+# Async runtime. Lib needs io-util (AsyncReadExt/AsyncWriteExt), sync (oneshot) and
+# macros (`select!`); `net` / `rt-multi-thread` are pulled in by the bin feature.
+tokio = { version = "1", default-features = false, features = ["io-util", "sync", "macros"] }
 
-# TLS - using shadow-tls fork with session ID generation hook
-tokio-rustls-fork-shadow-tls = "0.0.8"
-rustls-fork-shadow-tls = { version = "0.20.8", default-features = false }
-webpki-roots = "0.22"
+# TLS - using shadow-tls fork with session ID generation hook (client side only).
+tokio-rustls-fork-shadow-tls = { version = "0.0.8", optional = true }
+rustls-fork-shadow-tls = { version = "0.20.8", default-features = false, optional = true }
+webpki-roots = { version = "0.22", optional = true }
 
-# Crypto
-hmac = "0.12"
-sha1 = "0.10"
-sha2 = "0.10"
+# Crypto — kept on the same RustCrypto generation (digest 0.11) as the rest of the
+# zfc/private_tun graph so sha1/sha2 are not compiled twice.
+hmac = "0.13"
+sha1 = "0.11"
+sha2 = "0.11"
 
 # Utilities
 byteorder = "1"
-rand = "0.8"
+# Same major as zf-worker's direct `rand` so rand 0.8 + rand_chacha 0.3 disappear
+# from the graph.
+rand = "0.10"
 thiserror = "2"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 anyhow = "1"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive"], optional = true }
 pin-project-lite = "0.2"
 bytes = "1"
 

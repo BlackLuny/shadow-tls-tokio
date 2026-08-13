@@ -8,7 +8,6 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use byteorder::BigEndian;
-use rand::Rng;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use crate::crypto::{kdf, Hmac};
@@ -819,7 +818,7 @@ async fn send_alert<W: AsyncWrite + Unpin>(write: &mut W) -> io::Result<()> {
     buf[2] = TLS_MINOR_TLS12;
     buf[3] = 0x00;
     buf[4] = (FULL_SIZE - TLS_HEADER_SIZE) as u8;
-    rand::thread_rng().fill(&mut buf[TLS_HEADER_SIZE..]);
+    rand::fill(&mut buf[TLS_HEADER_SIZE..]);
     write.write_all(&buf).await?;
     write.flush().await
 }
@@ -1227,7 +1226,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for ShadowTlsServerStream<S> {
                         alert_buf[2] = TLS_MINOR_TLS12;
                         alert_buf[3] = 0x00;
                         alert_buf[4] = (FULL_SIZE - TLS_HEADER_SIZE) as u8;
-                        rand::thread_rng().fill(&mut alert_buf[TLS_HEADER_SIZE..]);
+                        rand::fill(&mut alert_buf[TLS_HEADER_SIZE..]);
                         this.alert_buf = Some(alert_buf);
                         this.alert_pos = 0;
                         this.shutdown_state = ShutdownState::SendingAlert;

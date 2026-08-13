@@ -1,6 +1,6 @@
 //! Cryptographic utilities for ShadowTLS protocol.
 
-use hmac::Mac;
+use hmac::{KeyInit, Mac};
 use sha2::{Digest, Sha256};
 
 use crate::protocol::HMAC_SIZE;
@@ -50,4 +50,35 @@ pub fn kdf(password: &str, server_random: &[u8]) -> Vec<u8> {
     hasher.update(password.as_bytes());
     hasher.update(server_random);
     hasher.finalize().to_vec()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Known-answer vectors. These bytes go on the wire (the 4-byte HMAC tag in the
+    /// ShadowTLS session id / frame header, and the KDF output keying the V3 stream),
+    /// so they pin interoperability with every other ShadowTLS implementation. They
+    /// exist to catch a silent behaviour change when the RustCrypto generation
+    /// underneath (hmac/sha1/sha2) is bumped — the reference values were produced
+    /// independently with Python `hmac`/`hashlib`.
+    #[test]
+    fn hmac_sha1_known_answer() {
+        let mut h = Hmac::new("password", (b"abc", b"C"));
+        h.update(b"hello");
+        assert_eq!(h.finalize(), [0x14, 0xf9, 0xfb, 0xde]);
+    }
+
+    #[test]
+    fn kdf_known_answer() {
+        let out = kdf("password", &[1, 2, 3]);
+        assert_eq!(
+            hex_lower(&out),
+            "c54139075c8cc46cd6decb74d35c415e5ab097a63afa76e222431d386b224a9e"
+        );
+    }
+
+    fn hex_lower(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
 }

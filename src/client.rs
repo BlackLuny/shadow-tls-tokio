@@ -5,8 +5,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use rand::seq::SliceRandom;
-use rand::Rng;
+use rand::prelude::IndexedRandom;
 use rustls_fork_shadow_tls::{OwnedTrustAnchor, RootCertStore, ServerName};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio_rustls_fork_shadow_tls::TlsConnector;
@@ -37,7 +36,7 @@ impl TlsNames {
     /// Randomly choose a server name.
     #[inline]
     pub fn random_choose(&self) -> &ServerName {
-        self.0.choose(&mut rand::thread_rng()).unwrap()
+        self.0.choose(&mut rand::rng()).unwrap()
     }
 }
 
@@ -539,7 +538,7 @@ async fn send_alert<W: AsyncWrite + Unpin>(write: &mut W) -> io::Result<()> {
     buf[2] = TLS_MINOR_TLS12;
     buf[3] = 0x00;
     buf[4] = (FULL_SIZE - TLS_HEADER_SIZE) as u8;
-    rand::thread_rng().fill(&mut buf[TLS_HEADER_SIZE..]);
+    rand::fill(&mut buf[TLS_HEADER_SIZE..]);
     write.write_all(&buf).await?;
     write.flush().await
 }
@@ -844,7 +843,7 @@ pub fn generate_session_id(hmac: &Hmac, client_hello: &[u8]) -> [u8; TLS_SESSION
     }
 
     let mut session_id = [0u8; TLS_SESSION_ID_SIZE];
-    rand::thread_rng().fill(&mut session_id[..TLS_SESSION_ID_SIZE - HMAC_SIZE]);
+    rand::fill(&mut session_id[..TLS_SESSION_ID_SIZE - HMAC_SIZE]);
 
     let mut hmac = hmac.to_owned();
     hmac.update(&client_hello[..SESSION_ID_START]);
@@ -1269,7 +1268,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for ShadowTlsClientStream<S> {
                         alert_buf[2] = TLS_MINOR_TLS12;
                         alert_buf[3] = 0x00;
                         alert_buf[4] = (FULL_SIZE - TLS_HEADER_SIZE) as u8;
-                        rand::thread_rng().fill(&mut alert_buf[TLS_HEADER_SIZE..]);
+                        rand::fill(&mut alert_buf[TLS_HEADER_SIZE..]);
                         this.alert_buf = Some(alert_buf);
                         this.alert_pos = 0;
                         this.shutdown_state = ClientShutdownState::SendingAlert;
