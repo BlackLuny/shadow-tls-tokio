@@ -157,6 +157,17 @@ pub struct ShadowTlsServer {
     v3: V3Mode,
 }
 
+/// Result of the handshake before an unauthenticated connection is relayed.
+/// The caller owns both streams on the fallback path and may use its own relay.
+pub enum ShadowTlsAccept<S, HIO> {
+    Authenticated(ShadowTlsServerStream<S>, Vec<u8>),
+    Fallback {
+        client: S,
+        handshake: HIO,
+        reason: io::ErrorKind,
+    },
+}
+
 impl ShadowTlsServer {
     /// Create a new ShadowTLS server.
     ///
@@ -202,9 +213,42 @@ impl ShadowTlsServer {
     /// initial data that was received during the handshake phase.
     pub async fn accept<S, HC, HS, HIO>(
         &self,
-        mut client_stream: S,
+        client_stream: S,
         handshake_connector: HC,
     ) -> io::Result<(ShadowTlsServerStream<S>, Vec<u8>)>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send,
+        HC: FnOnce(String) -> HS,
+        HIO: AsyncRead + AsyncWrite + Unpin + Send,
+        HS: std::future::Future<Output = io::Result<HIO>>,
+    {
+        match self.accept_with_fallback(client_stream, handshake_connector).await? {
+            ShadowTlsAccept::Authenticated(stream, prefix) => Ok((stream, prefix)),
+            ShadowTlsAccept::Fallback { mut client, mut handshake, reason } => {
+                tokio::io::copy_bidirectional(&mut client, &mut handshake).await?;
+                let message = match reason {
+                    io::ErrorKind::PermissionDenied => "client verification failed",
+                    io::ErrorKind::InvalidData => "failed to extract server random",
+                    io::ErrorKind::Unsupported => "TLS 1.3 not supported in strict mode",
+                    _ => "ShadowTLS handshake fallback",
+                };
+                Err(io::Error::new(reason, message))
+            }
+        }
+    }
+
+    /// Perform the handshake and return unauthenticated TCP streams to the caller.
+    /// The first ClientHello (and, for `InvalidData`/`Unsupported`, the first
+    /// server frame) has already been forwarded to the other side, so it will not
+    /// be read again from the returned streams; count it separately if needed.
+    /// `reason` tells a failed client HMAC (`PermissionDenied`) apart from an
+    /// authenticated client whose handshake server is unusable (`InvalidData`,
+    /// `Unsupported`).
+    pub async fn accept_with_fallback<S, HC, HS, HIO>(
+        &self,
+        mut client_stream: S,
+        handshake_connector: HC,
+    ) -> io::Result<ShadowTlsAccept<S, HIO>>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send,
         HC: FnOnce(String) -> HS,
@@ -247,11 +291,11 @@ impl ShadowTlsServer {
         if !client_hello_pass {
             // Client verification failed, work as SNI proxy
             tracing::warn!("ClientHello verify failed, working as SNI proxy");
-            tokio::io::copy_bidirectional(&mut client_stream, &mut handshake_stream).await?;
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "client verification failed",
-            ));
+            return Ok(ShadowTlsAccept::Fallback {
+                client: client_stream,
+                handshake: handshake_stream,
+                reason: io::ErrorKind::PermissionDenied,
+            });
         }
         tracing::debug!("ClientHello verify success");
 
@@ -263,12 +307,12 @@ impl ShadowTlsServer {
         let server_random = match extract_server_random(&first_server_frame) {
             Some(sr) => sr,
             None => {
-                tracing::warn!("ServerRandom extract failed, copying bidirectional");
-                tokio::io::copy_bidirectional(&mut client_stream, &mut handshake_stream).await?;
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "failed to extract server random",
-                ));
+                tracing::warn!("ServerRandom extract failed, using transparent fallback");
+                return Ok(ShadowTlsAccept::Fallback {
+                    client: client_stream,
+                    handshake: handshake_stream,
+                    reason: io::ErrorKind::InvalidData,
+                });
             }
         };
         tracing::debug!("ServerRandom extracted: {:?}", server_random);
@@ -276,11 +320,11 @@ impl ShadowTlsServer {
         let use_tls13 = support_tls13(&first_server_frame);
         if self.v3.strict() && !use_tls13 {
             tracing::error!("V3 strict mode and TLS 1.3 not supported");
-            tokio::io::copy_bidirectional(&mut client_stream, &mut handshake_stream).await?;
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "TLS 1.3 not supported in strict mode",
-            ));
+            return Ok(ShadowTlsAccept::Fallback {
+                client: client_stream,
+                handshake: handshake_stream,
+                reason: io::ErrorKind::Unsupported,
+            });
         }
 
         // Stage 1.3: Create HMACs and relay handshake
@@ -312,7 +356,7 @@ impl ShadowTlsServer {
             !use_tls13,
         );
 
-        Ok((stream, pure_data))
+        Ok(ShadowTlsAccept::Authenticated(stream, pure_data))
     }
 
     /// Relay a connection from a ShadowTLS client.
@@ -453,6 +497,148 @@ impl ShadowTlsServer {
 
         // Verified relay
         verified_relay(data_stream, client_stream, hmac_sr_s, hmac_sr_c, !use_tls13).await
+    }
+}
+
+#[cfg(test)]
+mod fallback_tests {
+    use super::*;
+
+    #[test]
+    fn invalid_client_hello_returns_both_streams_after_forwarding_prefix() {
+        tokio_test::block_on(async {
+            let server = ShadowTlsServer::new(
+                "unused".into(), TlsAddrs::new("fake:443".into()),
+                "secret".into(), V3Mode::Strict,
+            );
+            let (mut client_peer, client) = tokio::io::duplex(64);
+            let (handshake, mut target_peer) = tokio::io::duplex(64);
+            let hello = [22, 3, 3, 0, 0];
+            client_peer.write_all(&hello).await.unwrap();
+            client_peer.write_all(b"after hello").await.unwrap();
+            let outcome = server.accept_with_fallback(client, |_| async { Ok(handshake) })
+                .await.unwrap();
+            let ShadowTlsAccept::Fallback { mut client, mut handshake, reason } = outcome else {
+                panic!("invalid ClientHello must fall back");
+            };
+            assert_eq!(reason, io::ErrorKind::PermissionDenied);
+            let mut got_hello = [0; 5];
+            target_peer.read_exact(&mut got_hello).await.unwrap();
+            assert_eq!(got_hello, hello);
+            let mut next = [0; 11];
+            client.read_exact(&mut next).await.unwrap();
+            assert_eq!(&next, b"after hello");
+            handshake.write_all(b"response").await.unwrap();
+            let mut response = [0; 8];
+            target_peer.read_exact(&mut response).await.unwrap();
+            assert_eq!(&response, b"response");
+        });
+    }
+
+    #[test]
+    fn original_accept_still_relays_fallback_until_both_sides_close() {
+        tokio_test::block_on(async {
+            let server = ShadowTlsServer::new(
+                "unused".into(), TlsAddrs::new("fake:443".into()),
+                "secret".into(), V3Mode::Strict,
+            );
+            let (mut client_peer, client) = tokio::io::duplex(64);
+            let (handshake, mut target_peer) = tokio::io::duplex(64);
+            let client_task = async {
+                client_peer.write_all(&[22, 3, 3, 0, 0]).await.unwrap();
+                client_peer.write_all(b"payload").await.unwrap();
+                client_peer.shutdown().await.unwrap();
+                let mut response = Vec::new();
+                client_peer.read_to_end(&mut response).await.unwrap();
+                assert_eq!(response, b"response");
+            };
+            let target_task = async {
+                let mut input = Vec::new();
+                target_peer.read_to_end(&mut input).await.unwrap();
+                assert_eq!(input, b"\x16\x03\x03\0\0payload");
+                target_peer.write_all(b"response").await.unwrap();
+                target_peer.shutdown().await.unwrap();
+            };
+            let (outcome, (), ()) = tokio::join!(
+                server.accept(client, |_| async { Ok(handshake) }),
+                client_task,
+                target_task,
+            );
+            assert_eq!(outcome.err().unwrap().kind(), io::ErrorKind::PermissionDenied);
+        });
+    }
+
+    /// Minimal ClientHello whose session id carries a valid ShadowTLS HMAC.
+    fn authed_client_hello(password: &str) -> Vec<u8> {
+        let body_len = 1 + 3 + 2 + TLS_RANDOM_SIZE + 1 + TLS_SESSION_ID_SIZE;
+        let mut frame = vec![HANDSHAKE, TLS_MAJOR, TLS_MINOR_TLS10, 0, body_len as u8];
+        frame.extend_from_slice(&[CLIENT_HELLO, 0, 0, (body_len - 4) as u8, TLS_MAJOR, TLS_MINOR_TLS12]);
+        frame.extend_from_slice(&[7; TLS_RANDOM_SIZE]);
+        frame.push(TLS_SESSION_ID_SIZE as u8);
+        frame.extend_from_slice(&[9; TLS_SESSION_ID_SIZE]);
+        let hmac_idx = SESSION_ID_LEN_IDX + 1 + TLS_SESSION_ID_SIZE - HMAC_SIZE;
+        frame[hmac_idx..hmac_idx + HMAC_SIZE].fill(0);
+        let mut hmac = Hmac::new(password, (&[], &[]));
+        hmac.update(&frame[TLS_HEADER_SIZE..]);
+        let tag = hmac.finalize();
+        frame[hmac_idx..hmac_idx + HMAC_SIZE].copy_from_slice(&tag);
+        assert!(verified_extract_sni(&frame, password).0);
+        frame
+    }
+
+    /// Authenticated client, unusable first server frame: the frame reaches the
+    /// client before the handoff and the reason names the server-side cause.
+    async fn authed_fallback(server_frame: &[u8]) -> io::ErrorKind {
+        let server = ShadowTlsServer::new(
+            "unused".into(), TlsAddrs::new("fake:443".into()),
+            "secret".into(), V3Mode::Strict,
+        );
+        let (mut client_peer, client) = tokio::io::duplex(256);
+        let (handshake, mut target_peer) = tokio::io::duplex(256);
+        let hello = authed_client_hello("secret");
+        client_peer.write_all(&hello).await.unwrap();
+        target_peer.write_all(server_frame).await.unwrap();
+        let outcome = server.accept_with_fallback(client, |_| async { Ok(handshake) })
+            .await.unwrap();
+        let ShadowTlsAccept::Fallback { mut client, mut handshake, reason } = outcome else {
+            panic!("unusable server frame must fall back");
+        };
+        let mut got_hello = vec![0; hello.len()];
+        target_peer.read_exact(&mut got_hello).await.unwrap();
+        assert_eq!(got_hello, hello);
+        let mut got_frame = vec![0; server_frame.len()];
+        client_peer.read_exact(&mut got_frame).await.unwrap();
+        assert_eq!(got_frame, server_frame);
+        client_peer.write_all(b"up").await.unwrap();
+        let mut up = [0; 2];
+        client.read_exact(&mut up).await.unwrap();
+        assert_eq!(&up, b"up");
+        handshake.write_all(b"down").await.unwrap();
+        let mut down = [0; 4];
+        target_peer.read_exact(&mut down).await.unwrap();
+        assert_eq!(&down, b"down");
+        reason
+    }
+
+    #[test]
+    fn authed_client_with_non_server_hello_falls_back_as_invalid_data() {
+        tokio_test::block_on(async {
+            // A handshake record that is not a ServerHello has no server random.
+            let frame = [HANDSHAKE, TLS_MAJOR, TLS_MINOR_TLS12, 0, 1, 0x0b];
+            assert_eq!(authed_fallback(&frame).await, io::ErrorKind::InvalidData);
+        });
+    }
+
+    #[test]
+    fn authed_client_without_tls13_falls_back_as_unsupported_in_strict_mode() {
+        tokio_test::block_on(async {
+            // ServerHello truncated after the random: no supported_versions extension.
+            let body_len = 1 + 3 + 2 + TLS_RANDOM_SIZE;
+            let mut frame = vec![HANDSHAKE, TLS_MAJOR, TLS_MINOR_TLS12, 0, body_len as u8];
+            frame.extend_from_slice(&[SERVER_HELLO, 0, 0, (body_len - 4) as u8, TLS_MAJOR, TLS_MINOR_TLS12]);
+            frame.extend_from_slice(&[5; TLS_RANDOM_SIZE]);
+            assert_eq!(authed_fallback(&frame).await, io::ErrorKind::Unsupported);
+        });
     }
 }
 
