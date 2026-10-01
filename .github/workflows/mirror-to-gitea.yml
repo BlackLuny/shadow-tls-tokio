@@ -1,0 +1,52 @@
+# 把本仓库的全部分支与 tag 单向镜像到自建 Gitea（双备份）。
+# 需要 Actions secret GITEA_MIRROR_TOKEN：Gitea 个人 token，仅勾 write:repository。
+# 未配置该 secret 时直接跳过（不报红）。
+name: mirror-to-gitea
+
+on:
+  push:
+  delete:
+  schedule:
+    - cron: "17 * * * *"   # 兜底：漏触发时每小时补一次
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# 同一时刻只推一次；排队的最新一次会覆盖前面的，因为每次都是全量对齐 refs。
+concurrency:
+  group: mirror-to-gitea
+  cancel-in-progress: false
+
+env:
+  GITEA_URL: https://gitlab.coderluny.com/luny/${{ github.event.repository.name }}.git
+  GITEA_USER: luny
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check secret
+        id: gate
+        env:
+          T: ${{ secrets.GITEA_MIRROR_TOKEN }}
+        run: |
+          if [ -z "$T" ]; then echo "::warning::GITEA_MIRROR_TOKEN 未配置，跳过镜像"; echo "go=false" >> "$GITHUB_OUTPUT"; else echo "go=true" >> "$GITHUB_OUTPUT"; fi
+
+      - uses: actions/checkout@v4
+        if: steps.gate.outputs.go == 'true'
+        with:
+          fetch-depth: 0
+
+      - name: Mirror all branches and tags to Gitea
+        if: steps.gate.outputs.go == 'true'
+        env:
+          T: ${{ secrets.GITEA_MIRROR_TOKEN }}
+        run: |
+          set -euo pipefail
+          AUTH=$(printf '%s:%s' "$GITEA_USER" "$T" | base64 -w0)
+          echo "::add-mask::$AUTH"
+          git fetch --no-tags origin '+refs/heads/*:refs/mirror/heads/*' '+refs/tags/*:refs/tags/*'
+          git -c "http.extraheader=Authorization: Basic $AUTH" push --prune --force "$GITEA_URL" \
+            '+refs/mirror/heads/*:refs/heads/*' '+refs/tags/*:refs/tags/*'
