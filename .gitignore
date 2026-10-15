@@ -1,1 +1,5 @@
 /target
+
+# Local credentials must never be published.
+.env
+.env.*

@@ -23,7 +23,6 @@ async fn main() -> anyhow::Result<()> {
     println!("=== ShadowTLS V3 Client Test ===");
     println!("Server: {}", server_addr);
     println!("SNI: {}", sni);
-    println!("Password: {}", password);
     println!();
 
     let sni_list = vec![sni];

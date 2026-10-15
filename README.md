@@ -36,10 +36,10 @@ Add to your `Cargo.toml`:
 ```toml
 [dependencies]
 # Client + server.
-shadow-tls-tokio = { git = "https://github.com/user/shadow-tls-tokio" }
+shadow-tls-tokio = { git = "https://github.com/BlackLuny/shadow-tls-tokio" }
 
 # Server only — drops the rustls 0.20 fork / ring 0.16.
-shadow-tls-tokio = { git = "https://github.com/user/shadow-tls-tokio", default-features = false }
+shadow-tls-tokio = { git = "https://github.com/BlackLuny/shadow-tls-tokio", default-features = false }
 ```
 
 ## Usage

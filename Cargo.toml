@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 description = "A tokio-based implementation of ShadowTLS protocol"
-repository = "https://github.com/user/shadow-tls-tokio"
+repository = "https://github.com/BlackLuny/shadow-tls-tokio"
 
 [lib]
 name = "shadow_tls"
