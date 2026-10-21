@@ -942,7 +942,7 @@ dependencies = [
 [[package]]
 name = "webpki"
 version = "0.22.4"
-source = "git+https://github.com/BlackLuny/webpki?rev=4c8d3304bf7fd68a323d0e1202d1b1029cc64fe9#4c8d3304bf7fd68a323d0e1202d1b1029cc64fe9"
+source = "git+https://github.com/BlackLuny/webpki?rev=866466f04ff7684cfbb801d1926f6ff0c013f658#866466f04ff7684cfbb801d1926f6ff0c013f658"
 dependencies = [
  "ring 0.17.14",
  "untrusted 0.9.0",
