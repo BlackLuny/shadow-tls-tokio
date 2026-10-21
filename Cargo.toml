@@ -54,7 +54,7 @@ tokio = { version = "1", default-features = false, features = ["io-util", "sync"
 # TLS - using shadow-tls fork with session ID generation hook (client side only).
 tokio-rustls-fork-shadow-tls = { version = "0.0.8", optional = true }
 rustls-fork-shadow-tls = { version = "0.20.8", default-features = false, optional = true }
-webpki-roots = { version = "0.22", optional = true }
+webpki-roots = { version = "1.0.10", optional = true }
 
 # Crypto — kept on the same RustCrypto generation (digest 0.11) as the rest of the
 # zfc/private_tun graph so sha1/sha2 are not compiled twice.
@@ -77,3 +77,8 @@ bytes = "1"
 
 [dev-dependencies]
 tokio-test = "0.4"
+
+# RUSTSEC-2026-0382: the handshake fork still uses webpki 0.22.
+# Patches do not propagate: final binary workspaces must repeat this pin.
+[patch.crates-io]
+webpki = { git = "https://github.com/BlackLuny/webpki", rev = "866466f04ff7684cfbb801d1926f6ff0c013f658" }
