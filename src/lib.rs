@@ -12,11 +12,9 @@
 //!
 //! # Cargo features
 //!
-//! - `client` (default): the ShadowTLS client half. It is the only user of the
-//!   rustls **0.20** fork (`rustls-fork-shadow-tls`), which is the sole published
-//!   rustls exposing the ClientHello `session_id` generation hook V3 needs. Turn it
-//!   off (`default-features = false`) for server-only consumers to keep the legacy
-//!   ring 0.16 / webpki 0.22 TLS stack out of the dependency graph.
+//! - `client` (default): the ShadowTLS client using rustls 0.23 with a ClientHello
+//!   session ID hook. Apply the rustls patch in the final workspace. Server-only
+//!   consumers can disable default features.
 //! - `bin`: the two CLI binaries (`clap` + `tracing-subscriber`). Implies `client`.
 //!
 //! # Example

@@ -6,16 +6,21 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use rand::prelude::IndexedRandom;
-use rustls_fork_shadow_tls::{OwnedTrustAnchor, RootCertStore, ServerName};
+use rustls::crypto::aws_lc_rs::{self, kx_group};
+use rustls::pki_types::ServerName;
+use rustls::{ClientConfig, RootCertStore};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tokio_rustls_fork_shadow_tls::TlsConnector;
+use tokio_rustls::TlsConnector;
 
 use crate::crypto::{kdf, Hmac};
 use crate::protocol::*;
 
+#[cfg(test)]
+mod tests;
+
 /// TLS server names for client connections.
 #[derive(Clone, Debug, PartialEq)]
-pub struct TlsNames(Vec<ServerName>);
+pub struct TlsNames(Vec<ServerName<'static>>);
 
 impl TlsNames {
     /// Create new TlsNames from a list of server names.
@@ -23,7 +28,7 @@ impl TlsNames {
         let names: Result<Vec<_>, _> = names
             .into_iter()
             .map(|s| {
-                ServerName::try_from(s.as_str()).map_err(|_| anyhow::anyhow!("invalid server name"))
+                ServerName::try_from(s).map_err(|_| anyhow::anyhow!("invalid server name"))
             })
             .collect();
         let names = names?;
@@ -35,7 +40,7 @@ impl TlsNames {
 
     /// Randomly choose a server name.
     #[inline]
-    pub fn random_choose(&self) -> &ServerName {
+    pub fn random_choose(&self) -> &ServerName<'static> {
         self.0.choose(&mut rand::rng()).unwrap()
     }
 }
@@ -123,21 +128,28 @@ impl ShadowTlsClient {
         tls_ext_config: Option<TlsExtConfig>,
         v3: V3Mode,
     ) -> anyhow::Result<Self> {
+        let roots = RootCertStore {
+            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+        };
+        Self::new_with_roots(target_addr, tls_names, password, tls_ext_config, v3, roots)
+    }
+
+    fn new_with_roots(
+        target_addr: String,
+        tls_names: Vec<String>,
+        password: String,
+        tls_ext_config: Option<TlsExtConfig>,
+        v3: V3Mode,
+        roots: RootCertStore,
+    ) -> anyhow::Result<Self> {
         let tls_names = TlsNames::new(tls_names)?;
 
-        let mut root_store = RootCertStore::empty();
-        root_store.add_server_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.iter().map(|ta| {
-            OwnedTrustAnchor::from_subject_spki_name_constraints(
-                ta.subject.as_ref(),
-                ta.subject_public_key_info.as_ref(),
-                ta.name_constraints.as_ref().map(|value| value.as_ref()),
-            )
-        }));
-
-        // TLS 1.2 and TLS 1.3 is enabled.
-        let mut config = rustls_fork_shadow_tls::ClientConfig::builder()
-            .with_safe_defaults()
-            .with_root_certificates(root_store)
+        let mut provider = aws_lc_rs::default_provider();
+        // Retain the existing key-share groups even when another consumer enables PQ groups.
+        provider.kx_groups = vec![kx_group::X25519, kx_group::SECP256R1, kx_group::SECP384R1];
+        let mut config = ClientConfig::builder_with_provider(Arc::new(provider))
+            .with_safe_default_protocol_versions()?
+            .with_root_certificates(roots)
             .with_no_client_auth();
 
         if let Some(ext) = tls_ext_config {
@@ -146,7 +158,11 @@ impl ShadowTlsClient {
             }
         }
 
-        let tls_connector = TlsConnector::from(config);
+        let hmac_init = Hmac::new(&password, (&[], &[]));
+        config
+            .dangerous()
+            .set_legacy_session_id_generator(move |hello| generate_session_id(&hmac_init, hello));
+        let tls_connector = TlsConnector::from(Arc::new(config));
 
         Ok(Self {
             target_addr: Arc::new(target_addr),
@@ -163,7 +179,7 @@ impl ShadowTlsClient {
     }
 
     /// Get the SNI name.
-    pub fn get_sni(&self) -> &ServerName {
+    pub fn get_sni(&self) -> &ServerName<'static> {
         self.tls_names.random_choose()
     }
 
@@ -192,19 +208,15 @@ impl ShadowTlsClient {
 
         tracing::debug!("starting V3 connect");
 
-        // Stage 1: TLS handshake with custom session ID generator
+        // Stage 1: TLS handshake
         let sni = self.tls_names.random_choose().clone();
-        let hmac_init = Hmac::new(&self.password, (&[], &[]));
 
         // Wrap the server stream to intercept handshake data
         let wrapper = StreamWrapper::new(server_stream, &self.password);
 
-        // Perform TLS handshake with session ID generator
         let tls_stream = self
             .tls_connector
-            .connect_with_session_id_generator(sni, wrapper, move |data| {
-                generate_session_id(&hmac_init, data)
-            })
+            .connect(sni, wrapper)
             .await
             .map_err(|e| {
                 io::Error::new(io::ErrorKind::Other, format!("TLS handshake failed: {}", e))
@@ -213,7 +225,7 @@ impl ShadowTlsClient {
         tracing::trace!("TLS handshake success");
 
         // Get the inner wrapper back
-        let (io, session) = tls_stream.into_parts();
+        let (io, session) = tls_stream.into_inner();
 
         // Check authorization
         let authorized = io.authorized();
@@ -284,19 +296,15 @@ impl ShadowTlsClient {
     {
         tracing::trace!("starting V3 relay");
 
-        // Stage 1: TLS handshake with custom session ID generator
+        // Stage 1: TLS handshake
         let sni = self.tls_names.random_choose().clone();
-        let hmac_init = Hmac::new(&self.password, (&[], &[]));
 
         // Wrap the server stream to intercept handshake data
         let wrapper = StreamWrapper::new(server_stream, &self.password);
 
-        // Perform TLS handshake with session ID generator
         let tls_stream = self
             .tls_connector
-            .connect_with_session_id_generator(sni, wrapper, move |data| {
-                generate_session_id(&hmac_init, data)
-            })
+            .connect(sni, wrapper)
             .await
             .map_err(|e| {
                 io::Error::new(io::ErrorKind::Other, format!("TLS handshake failed: {}", e))
@@ -305,7 +313,7 @@ impl ShadowTlsClient {
         tracing::trace!("TLS handshake success");
 
         // Get the inner wrapper back
-        let (io, session) = tls_stream.into_parts();
+        let (io, session) = tls_stream.into_inner();
 
         // Check authorization
         let authorized = io.authorized();
