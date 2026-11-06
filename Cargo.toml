@@ -22,15 +22,10 @@ required-features = ["bin-server"]
 
 [features]
 default = ["client"]
-# ShadowTLS **client** side. Kept behind a feature because it is the only thing in
-# this crate that needs `rustls-fork-shadow-tls` — a rustls **0.20** fork, the sole
-# published rustls build exposing the ClientHello `session_id` generation hook that
-# ShadowTLS v3 requires. That fork drags in ring 0.16 / webpki 0.22 / sct alongside
-# the modern rustls 0.23 stack the rest of the dependency graph uses. Server-only
-# consumers (e.g. zfc's inbound ShadowTLS) should set `default-features = false`.
+# Server-only consumers can disable default features to omit the TLS client stack.
 client = [
-    "dep:rustls-fork-shadow-tls",
-    "dep:tokio-rustls-fork-shadow-tls",
+    "dep:rustls",
+    "dep:tokio-rustls",
     "dep:webpki-roots",
     "tokio/net",
 ]
@@ -39,8 +34,7 @@ client = [
 # matchers/nu-ansi-term/sharded-slab/thread_local/regex-automata).
 cli = ["dep:clap", "dep:tracing-subscriber", "tokio/rt-multi-thread", "tokio/net"]
 # `shadow-tls-server` deliberately does NOT imply `client`: src/bin/server.rs only
-# touches the server half, so building just that binary stays free of the rustls 0.20
-# fork. `shadow-tls-client` of course needs it.
+# touches the server half.
 bin-server = ["cli"]
 bin-client = ["cli", "client"]
 # Convenience: both binaries.
@@ -51,9 +45,9 @@ bin = ["bin-client", "bin-server"]
 # macros (`select!`); `net` / `rt-multi-thread` are pulled in by the bin feature.
 tokio = { version = "1", default-features = false, features = ["io-util", "sync", "macros"] }
 
-# TLS - using shadow-tls fork with session ID generation hook (client side only).
-tokio-rustls-fork-shadow-tls = { version = "0.0.8", optional = true }
-rustls-fork-shadow-tls = { version = "0.20.8", default-features = false, optional = true }
+# The workspace patch supplies the ClientHello session ID hook for the client.
+rustls = { version = "=0.23.44", default-features = false, features = ["aws-lc-rs", "std", "tls12"], optional = true }
+tokio-rustls = { version = "0.26", default-features = false, optional = true }
 webpki-roots = { version = "1.0.10", optional = true }
 
 # Crypto — kept on the same RustCrypto generation (digest 0.11) as the rest of the
@@ -76,9 +70,10 @@ pin-project-lite = "0.2"
 bytes = "1"
 
 [dev-dependencies]
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs"] }
+tokio = { version = "1", features = ["rt", "time"] }
 tokio-test = "0.4"
 
-# RUSTSEC-2026-0382: the handshake fork still uses webpki 0.22.
-# Patches do not propagate: final binary workspaces must repeat this pin.
+# Cargo patches apply at the build root. Client consumers must repeat this pin.
 [patch.crates-io]
-webpki = { git = "https://github.com/BlackLuny/webpki", rev = "866466f04ff7684cfbb801d1926f6ff0c013f658" }
+rustls = { git = "https://github.com/BlackLuny/rustls", rev = "6a0e60cc54ebc9a17cce66b60d59902ab4b38826" }

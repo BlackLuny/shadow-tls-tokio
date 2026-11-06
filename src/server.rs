@@ -4,7 +4,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{self, Cursor, Read};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 
 use byteorder::BigEndian;
@@ -374,8 +374,8 @@ impl ShadowTlsServer {
         tracing::debug!("ServerRandom extracted: {:?}", server_random);
 
         let use_tls13 = support_tls13(&first_server_frame);
-        if self.v3.strict() && !use_tls13 {
-            tracing::error!("V3 strict mode and TLS 1.3 not supported");
+        if !use_tls13 && (self.v3.strict() || server_random == HELLO_RETRY_REQUEST_RANDOM) {
+            tracing::error!("V3 handshake requires TLS 1.3");
             return Ok(ShadowTlsDeferredAccept::Complete(ShadowTlsAccept::Fallback {
                 client: client_stream,
                 handshake: handshake_stream,
@@ -383,19 +383,12 @@ impl ShadowTlsServer {
             }));
         }
 
-        // Stage 1.3: Create HMACs and relay handshake
-        let mut hmac_sr_c = Hmac::new(&self.password, (&server_random, b"C"));
-        let hmac_sr_s = Hmac::new(&self.password, (&server_random, b"S"));
-        let mut hmac_sr = Hmac::new(&self.password, (&server_random, &[]));
-        let key = kdf(&self.password, &server_random);
-
-        // Relay handshake until we get authenticated data from client
-        let (pure_data, hmac_sr_c) = relay_handshake(
+        // Stage 1.3: Relay the handshake until the client sends authenticated data.
+        let (pure_data, hmac_sr_c, hmac_sr_s) = relay_handshake(
             &mut client_stream,
             &mut handshake_stream,
-            &mut hmac_sr_c,
-            &mut hmac_sr,
-            &key,
+            &self.password,
+            server_random,
         )
         .await?;
 
@@ -516,25 +509,18 @@ impl ShadowTlsServer {
         tracing::debug!("ServerRandom extracted: {:?}", server_random);
 
         let use_tls13 = support_tls13(&first_server_frame);
-        if self.v3.strict() && !use_tls13 {
-            tracing::error!("V3 strict mode and TLS 1.3 not supported");
+        if !use_tls13 && (self.v3.strict() || server_random == HELLO_RETRY_REQUEST_RANDOM) {
+            tracing::error!("V3 handshake requires TLS 1.3");
             tokio::io::copy_bidirectional(&mut client_stream, &mut handshake_stream).await?;
             return Ok(());
         }
 
-        // Stage 1.3: Create HMACs and relay handshake
-        let mut hmac_sr_c = Hmac::new(&self.password, (&server_random, b"C"));
-        let hmac_sr_s = Hmac::new(&self.password, (&server_random, b"S"));
-        let mut hmac_sr = Hmac::new(&self.password, (&server_random, &[]));
-        let key = kdf(&self.password, &server_random);
-
-        // Relay handshake until we get authenticated data from client
-        let (pure_data, hmac_sr_c) = relay_handshake(
+        // Stage 1.3: Relay the handshake until the client sends authenticated data.
+        let (pure_data, hmac_sr_c, hmac_sr_s) = relay_handshake(
             &mut client_stream,
             &mut handshake_stream,
-            &mut hmac_sr_c,
-            &mut hmac_sr,
-            &key,
+            &self.password,
+            server_random,
         )
         .await?;
 
@@ -782,6 +768,27 @@ mod fallback_tests {
             assert_eq!(authed_fallback(&frame).await, io::ErrorKind::Unsupported);
         });
     }
+
+    #[test]
+    fn rejects_a_second_hello_retry_request() {
+        tokio_test::block_on(async {
+            let mut hello = vec![TLS_MAJOR, TLS_MINOR_TLS12];
+            hello.extend_from_slice(&HELLO_RETRY_REQUEST_RANDOM);
+            // Empty session ID, AES-128-GCM, null compression, TLS 1.3 and P-256.
+            hello.extend_from_slice(&[0, 0x13, 0x01, 0, 0, 12, 0, 43, 0, 2, 3, 4, 0, 51, 0, 2, 0, 23]);
+            let mut frame = vec![HANDSHAKE, TLS_MAJOR, TLS_MINOR_TLS12, 0, (4 + hello.len()) as u8];
+            frame.extend_from_slice(&[SERVER_HELLO, 0, 0, hello.len() as u8]);
+            frame.extend_from_slice(&hello);
+
+            let (_client_peer, mut client) = tokio::io::duplex(128);
+            let (mut decoy_peer, mut decoy) = tokio::io::duplex(128);
+            decoy_peer.write_all(&frame).await.unwrap();
+            let Err(error) = relay_handshake(&mut client, &mut decoy, "secret", HELLO_RETRY_REQUEST_RANDOM).await else {
+                panic!("a second retry must fail the handshake");
+            };
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        });
+    }
 }
 
 /// Read a complete TLS frame.
@@ -890,14 +897,13 @@ fn cursor_skip<T: AsRef<[u8]>>(cursor: &mut Cursor<T>, n: usize) -> io::Result<(
 }
 
 /// Relay handshake between client and handshake server.
-/// Returns (pure_data, updated_hmac_c) where updated_hmac_c is the HMAC state after processing.
+/// Return the first authenticated payload and the client and server HMAC states.
 async fn relay_handshake<C, H>(
     client: &mut C,
     handshake: &mut H,
-    hmac_c: &mut Hmac,
-    hmac_sr: &mut Hmac,
-    key: &[u8],
-) -> io::Result<(Vec<u8>, Hmac)>
+    password: &str,
+    first_server_random: [u8; TLS_RANDOM_SIZE],
+) -> io::Result<(Vec<u8>, Hmac, Hmac)>
 where
     C: AsyncRead + AsyncWrite + Unpin,
     H: AsyncRead + AsyncWrite + Unpin,
@@ -909,28 +915,32 @@ where
     let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
     let mut tx = Some(tx);
 
-    let hmac_c_clone = hmac_c.to_owned();
-    let key_clone = key.to_vec();
+    // The decoy supplies the random after the second ClientHello on a retry.
+    let server_random = OnceLock::new();
+    if first_server_random != HELLO_RETRY_REQUEST_RANDOM {
+        let _ = server_random.set(first_server_random);
+    }
 
     // Copy client -> handshake until HMAC matches
-    // Returns (pure_data, updated_hmac)
     let client_to_handshake = async {
-        let mut hmac = hmac_c_clone;
+        let mut hmac = None;
         loop {
             let frame = read_tls_frame(&mut c_read).await?;
 
             if frame.len() > TLS_HMAC_HEADER_SIZE && frame[0] == APPLICATION_DATA {
-                // Check HMAC
-                let mut tmp_hmac = hmac.to_owned();
-                tmp_hmac.update(&frame[TLS_HMAC_HEADER_SIZE..]);
-                let h = tmp_hmac.finalize();
+                if let Some(random) = server_random.get() {
+                    let mut next = hmac
+                        .get_or_insert_with(|| Hmac::new(password, (random, b"C")))
+                        .to_owned();
+                    let payload = &frame[TLS_HMAC_HEADER_SIZE..];
+                    next.update(payload);
+                    let tag = next.finalize();
 
-                if frame[TLS_HEADER_SIZE..TLS_HMAC_HEADER_SIZE] == h {
-                    // HMAC matches! Update state and return pure data
-                    hmac.update(&frame[TLS_HMAC_HEADER_SIZE..]);
-                    hmac.update(&frame[TLS_HEADER_SIZE..TLS_HMAC_HEADER_SIZE]);
-                    let pure_data = frame[TLS_HMAC_HEADER_SIZE..].to_vec();
-                    return Ok::<_, io::Error>((pure_data, hmac));
+                    if frame[TLS_HEADER_SIZE..TLS_HMAC_HEADER_SIZE] == tag {
+                        next.update(&tag);
+                        let send_hmac = Hmac::new(password, (random, b"S"));
+                        return Ok::<_, io::Error>((payload.to_vec(), next, send_hmac));
+                    }
                 }
             }
 
@@ -942,7 +952,10 @@ where
 
     // Copy handshake -> client with modification
     let handshake_to_client = async {
-        let mut hmac = hmac_sr.to_owned();
+        let disguise = |random: &[u8; TLS_RANDOM_SIZE]| {
+            (Hmac::new(password, (random, &[])), kdf(password, random))
+        };
+        let mut disguise_state = server_random.get().map(disguise);
         loop {
             tokio::select! {
                 _ = &mut rx => {
@@ -952,9 +965,22 @@ where
                 frame_result = read_tls_frame(&mut h_read) => {
                     let mut frame = frame_result?;
 
-                    if frame[0] == APPLICATION_DATA {
+                    if disguise_state.is_none() {
+                        match frame[0] {
+                            CHANGE_CIPHER_SPEC | ALERT => {}
+                            HANDSHAKE => {
+                                let random = extract_server_random(&frame)
+                                    .filter(|random| *random != HELLO_RETRY_REQUEST_RANDOM && support_tls13(&frame))
+                                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "expected TLS 1.3 ServerHello after retry"))?;
+                                disguise_state = Some(disguise(&random));
+                                // Publish the seed before the client can read the ServerHello.
+                                let _ = server_random.set(random);
+                            }
+                            _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "unexpected record before retry ServerHello")),
+                        }
+                    } else if let (APPLICATION_DATA, Some((hmac, key))) = (frame[0], disguise_state.as_mut()) {
                         // Modify: XOR data, add HMAC
-                        xor_slice(&mut frame[TLS_HEADER_SIZE..], &key_clone);
+                        xor_slice(&mut frame[TLS_HEADER_SIZE..], key);
                         hmac.update(&frame[TLS_HEADER_SIZE..]);
                         let hash = hmac.finalize();
 
@@ -978,12 +1004,12 @@ where
 
     tokio::select! {
         result = client_to_handshake => {
-            let (pure_data, updated_hmac) = result?;
+            let authenticated = result?;
             // Signal the other task to stop
             if let Some(tx) = tx.take() {
                 let _ = tx.send(());
             }
-            Ok((pure_data, updated_hmac))
+            Ok(authenticated)
         }
         result = handshake_to_client => {
             result?;

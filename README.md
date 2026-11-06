@@ -15,14 +15,13 @@ A Tokio-based implementation of the [ShadowTLS](https://github.com/ihciah/shadow
 
 | Feature | Default | What it pulls in |
 |---|---|---|
-| `client` | yes | The ShadowTLS **client** half. It is the only user of `rustls-fork-shadow-tls` — a rustls **0.20** fork, the sole published rustls exposing the ClientHello `session_id` generation hook V3 needs. It therefore drags in the legacy `ring 0.16` / `webpki 0.22` / `sct` stack. |
+| `client` | yes | The ShadowTLS client using rustls 0.23, its ClientHello session ID hook, and tokio-rustls 0.26. |
 | `cli` | **no** | CLI plumbing shared by the binaries (`clap` + `tracing-subscriber`). |
-| `bin-server` | **no** | `shadow-tls-server`. Implies `cli` only — building just the server CLI stays free of the rustls 0.20 fork. |
+| `bin-server` | **no** | `shadow-tls-server`. Implies `cli`. |
 | `bin-client` | **no** | `shadow-tls-client`. Implies `cli` + `client`. |
 | `bin` | **no** | Both binaries. |
 
-Server-only consumers should set `default-features = false` to keep the legacy TLS
-stack out of their dependency graph entirely.
+Server-only consumers can use `default-features = false` to omit the TLS client stack.
 
 `bin` is off by default so that library consumers do not compile `clap` and
 `tracing-subscriber`. Both `[[bin]]` targets declare `required-features = ["bin"]`,
@@ -31,14 +30,21 @@ which means **a plain `cargo build` silently produces no binaries** — pass
 
 ## Installation
 
-Add to your `Cargo.toml`:
+For client use, add the dependency and rustls patch to the final Cargo workspace.
+Cargo applies patches from the workspace root.
 
 ```toml
 [dependencies]
-# Client + server.
 shadow-tls-tokio = { git = "https://github.com/BlackLuny/shadow-tls-tokio" }
 
-# Server only — drops the rustls 0.20 fork / ring 0.16.
+[patch.crates-io]
+rustls = { git = "https://github.com/BlackLuny/rustls", rev = "6a0e60cc54ebc9a17cce66b60d59902ab4b38826" }
+```
+
+For server-only use, the dependency is sufficient.
+
+```toml
+[dependencies]
 shadow-tls-tokio = { git = "https://github.com/BlackLuny/shadow-tls-tokio", default-features = false }
 ```
 
