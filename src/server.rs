@@ -168,6 +168,24 @@ pub enum ShadowTlsAccept<S, HIO> {
     },
 }
 
+/// Authentication of the first complete client record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClientHelloVerdict {
+    Verified,
+    Rejected,
+}
+
+/// Accept outcome for callers that can replay a rejected hello as part of their
+/// transparent relay. The rejected record has not been written upstream.
+pub enum ShadowTlsDeferredAccept<S, HIO> {
+    Complete(ShadowTlsAccept<S, HIO>),
+    RejectedHello {
+        client: S,
+        handshake: HIO,
+        client_hello: Vec<u8>,
+    },
+}
+
 impl ShadowTlsServer {
     /// Create a new ShadowTLS server.
     ///
@@ -246,9 +264,43 @@ impl ShadowTlsServer {
     /// `Unsupported`).
     pub async fn accept_with_fallback<S, HC, HS, HIO>(
         &self,
-        mut client_stream: S,
+        client_stream: S,
         handshake_connector: HC,
     ) -> io::Result<ShadowTlsAccept<S, HIO>>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send,
+        HC: FnOnce(String) -> HS,
+        HIO: AsyncRead + AsyncWrite + Unpin + Send,
+        HS: std::future::Future<Output = io::Result<HIO>>,
+    {
+        match self
+            .accept_with_deferred_fallback(client_stream, handshake_connector, |_| {})
+            .await?
+        {
+            ShadowTlsDeferredAccept::Complete(outcome) => Ok(outcome),
+            ShadowTlsDeferredAccept::RejectedHello { client, mut handshake, client_hello } => {
+                handshake.write_all(&client_hello).await?;
+                handshake.flush().await?;
+                tracing::debug!("forwarded ClientHello to handshake server success");
+                tracing::warn!("ClientHello verify failed, working as SNI proxy");
+                Ok(ShadowTlsAccept::Fallback {
+                    client,
+                    handshake,
+                    reason: io::ErrorKind::PermissionDenied,
+                })
+            }
+        }
+    }
+
+    /// Notify the caller of the HMAC verdict before calling the connector.
+    /// A short read returns an error without notifying. A complete record that
+    /// fails verification is handed off with its original bytes for replay.
+    pub async fn accept_with_deferred_fallback<S, HC, HS, HIO>(
+        &self,
+        mut client_stream: S,
+        handshake_connector: HC,
+        on_client_hello: impl FnOnce(ClientHelloVerdict),
+    ) -> io::Result<ShadowTlsDeferredAccept<S, HIO>>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send,
         HC: FnOnce(String) -> HS,
@@ -267,6 +319,11 @@ impl ShadowTlsServer {
         // Stage 1.1: Read and validate ClientHello
         let first_client_frame = read_tls_frame(&mut client_stream).await?;
         let (client_hello_pass, sni) = verified_extract_sni(&first_client_frame, &self.password);
+        on_client_hello(if client_hello_pass {
+            ClientHelloVerdict::Verified
+        } else {
+            ClientHelloVerdict::Rejected
+        });
 
         tracing::debug!("client_hello_pass: {}, sni: {:?}", client_hello_pass, sni);
 
@@ -281,6 +338,14 @@ impl ShadowTlsServer {
 
         tracing::debug!("connected to handshake server success",);
 
+        if !client_hello_pass {
+            return Ok(ShadowTlsDeferredAccept::RejectedHello {
+                client: client_stream,
+                handshake: handshake_stream,
+                client_hello: first_client_frame,
+            });
+        }
+
         // Forward ClientHello to handshake server
         handshake_stream.write_all(&first_client_frame).await?;
 
@@ -288,15 +353,6 @@ impl ShadowTlsServer {
 
         tracing::debug!("forwarded ClientHello to handshake server success",);
 
-        if !client_hello_pass {
-            // Client verification failed, work as SNI proxy
-            tracing::warn!("ClientHello verify failed, working as SNI proxy");
-            return Ok(ShadowTlsAccept::Fallback {
-                client: client_stream,
-                handshake: handshake_stream,
-                reason: io::ErrorKind::PermissionDenied,
-            });
-        }
         tracing::debug!("ClientHello verify success");
 
         // Stage 1.2: Read ServerHello and extract server random
@@ -308,11 +364,11 @@ impl ShadowTlsServer {
             Some(sr) => sr,
             None => {
                 tracing::warn!("ServerRandom extract failed, using transparent fallback");
-                return Ok(ShadowTlsAccept::Fallback {
+                return Ok(ShadowTlsDeferredAccept::Complete(ShadowTlsAccept::Fallback {
                     client: client_stream,
                     handshake: handshake_stream,
                     reason: io::ErrorKind::InvalidData,
-                });
+                }));
             }
         };
         tracing::debug!("ServerRandom extracted: {:?}", server_random);
@@ -320,11 +376,11 @@ impl ShadowTlsServer {
         let use_tls13 = support_tls13(&first_server_frame);
         if self.v3.strict() && !use_tls13 {
             tracing::error!("V3 strict mode and TLS 1.3 not supported");
-            return Ok(ShadowTlsAccept::Fallback {
+            return Ok(ShadowTlsDeferredAccept::Complete(ShadowTlsAccept::Fallback {
                 client: client_stream,
                 handshake: handshake_stream,
                 reason: io::ErrorKind::Unsupported,
-            });
+            }));
         }
 
         // Stage 1.3: Create HMACs and relay handshake
@@ -356,7 +412,7 @@ impl ShadowTlsServer {
             !use_tls13,
         );
 
-        Ok(ShadowTlsAccept::Authenticated(stream, pure_data))
+        Ok(ShadowTlsDeferredAccept::Complete(ShadowTlsAccept::Authenticated(stream, pure_data)))
     }
 
     /// Relay a connection from a ShadowTLS client.
@@ -503,6 +559,7 @@ impl ShadowTlsServer {
 #[cfg(test)]
 mod fallback_tests {
     use super::*;
+    use std::cell::Cell;
 
     #[test]
     fn invalid_client_hello_returns_both_streams_after_forwarding_prefix() {
@@ -584,6 +641,91 @@ mod fallback_tests {
         frame[hmac_idx..hmac_idx + HMAC_SIZE].copy_from_slice(&tag);
         assert!(verified_extract_sni(&frame, password).0);
         frame
+    }
+
+    #[test]
+    fn rejected_hello_is_reported_before_dial_and_returned_for_replay() {
+        tokio_test::block_on(async {
+            let server = ShadowTlsServer::new(
+                "unused".into(), TlsAddrs::new("fake:443".into()),
+                "secret".into(), V3Mode::Strict,
+            );
+            let (mut peer, client) = tokio::io::duplex(128);
+            let (handshake, mut origin) = tokio::io::duplex(1);
+            let hello = authed_client_hello("different-password");
+            peer.write_all(&hello).await.unwrap();
+            peer.write_all(b"next").await.unwrap();
+            let verdict = Cell::new(None);
+            let outcome = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                server.accept_with_deferred_fallback(
+                    client,
+                    |_| {
+                        assert_eq!(verdict.get(), Some(ClientHelloVerdict::Rejected));
+                        async { Ok(handshake) }
+                    },
+                    |value| verdict.set(Some(value)),
+                ),
+            ).await.expect("handoff must not block on the one-byte upstream buffer").unwrap();
+            let ShadowTlsDeferredAccept::RejectedHello { mut client, mut handshake, client_hello } = outcome else {
+                panic!("wrong HMAC must hand off for replay");
+            };
+            assert_eq!(client_hello, hello);
+            let mut next = [0; 4];
+            client.read_exact(&mut next).await.unwrap();
+            assert_eq!(&next, b"next");
+            let mut forwarded = vec![0; hello.len()];
+            let (write, read) = tokio::join!(
+                handshake.write_all(&client_hello),
+                origin.read_exact(&mut forwarded),
+            );
+            write.unwrap();
+            read.unwrap();
+            assert_eq!(forwarded, hello);
+        });
+    }
+
+    #[test]
+    fn verified_hello_is_reported_before_dial() {
+        tokio_test::block_on(async {
+            let server = ShadowTlsServer::new(
+                "unused".into(), TlsAddrs::new("fake:443".into()),
+                "secret".into(), V3Mode::Strict,
+            );
+            let (mut peer, client) = tokio::io::duplex(128);
+            peer.write_all(&authed_client_hello("secret")).await.unwrap();
+            let verdict = Cell::new(None);
+            let result = server.accept_with_deferred_fallback(
+                client,
+                |_| {
+                    assert_eq!(verdict.get(), Some(ClientHelloVerdict::Verified));
+                    async { Err::<tokio::io::DuplexStream, _>(io::ErrorKind::ConnectionRefused.into()) }
+                },
+                |value| verdict.set(Some(value)),
+            ).await;
+            assert_eq!(result.err().unwrap().kind(), io::ErrorKind::ConnectionRefused);
+        });
+    }
+
+    #[test]
+    fn incomplete_hello_does_not_report_a_verdict_or_dial() {
+        tokio_test::block_on(async {
+            let server = ShadowTlsServer::new(
+                "unused".into(), TlsAddrs::new("fake:443".into()),
+                "secret".into(), V3Mode::Strict,
+            );
+            let (mut peer, client) = tokio::io::duplex(128);
+            peer.write_all(&[22, 3, 3, 0, 8]).await.unwrap();
+            peer.shutdown().await.unwrap();
+            let result = server.accept_with_deferred_fallback(
+                client,
+                |_| -> std::future::Ready<io::Result<tokio::io::DuplexStream>> {
+                    panic!("incomplete record must not dial")
+                },
+                |_| panic!("incomplete record must not have a verdict"),
+            ).await;
+            assert_eq!(result.err().unwrap().kind(), io::ErrorKind::UnexpectedEof);
+        });
     }
 
     /// Authenticated client, unusable first server frame: the frame reaches the
