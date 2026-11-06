@@ -56,4 +56,7 @@ mod stream;
 #[cfg(feature = "client")]
 pub use client::{ShadowTlsClient, ShadowTlsClientStream, TlsExtConfig, TlsNames};
 pub use protocol::V3Mode;
-pub use server::{ShadowTlsAccept, ShadowTlsServer, ShadowTlsServerStream, TlsAddrs, WildcardSNI};
+pub use server::{
+    ClientHelloVerdict, ShadowTlsAccept, ShadowTlsDeferredAccept, ShadowTlsServer,
+    ShadowTlsServerStream, TlsAddrs, WildcardSNI,
+};
