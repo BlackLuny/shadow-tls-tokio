@@ -704,7 +704,7 @@ dependencies = [
 [[package]]
 name = "rustls"
 version = "0.23.44"
-source = "git+https://github.com/BlackLuny/rustls?rev=cad360ccc9d3533ee8d7fa9f9028f426eb31e3ef#cad360ccc9d3533ee8d7fa9f9028f426eb31e3ef"
+source = "git+https://github.com/BlackLuny/rustls?rev=6a0e60cc54ebc9a17cce66b60d59902ab4b38826#6a0e60cc54ebc9a17cce66b60d59902ab4b38826"
 dependencies = [
  "aws-lc-rs",
  "once_cell",

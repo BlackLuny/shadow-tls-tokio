@@ -618,14 +618,9 @@ impl<S> StreamWrapper<S> {
 
         match frame[0] {
             HANDSHAKE => {
-                if frame.len() > SERVER_RANDOM_IDX + TLS_RANDOM_SIZE
-                    && frame.len() > 5
-                    && frame[5] == SERVER_HELLO
+                if let Some(server_random) = extract_server_random(frame)
+                    .filter(|random| *random != HELLO_RETRY_REQUEST_RANDOM)
                 {
-                    let mut server_random = [0u8; TLS_RANDOM_SIZE];
-                    server_random.copy_from_slice(
-                        &frame[SERVER_RANDOM_IDX..SERVER_RANDOM_IDX + TLS_RANDOM_SIZE],
-                    );
                     self.tls13 = support_tls13(frame);
 
                     let hmac = Hmac::new(&self.password, (&server_random, &[]));

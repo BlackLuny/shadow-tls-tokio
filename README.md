@@ -38,7 +38,7 @@ Cargo applies patches from the workspace root.
 shadow-tls-tokio = { git = "https://github.com/BlackLuny/shadow-tls-tokio" }
 
 [patch.crates-io]
-rustls = { git = "https://github.com/BlackLuny/rustls", rev = "cad360ccc9d3533ee8d7fa9f9028f426eb31e3ef" }
+rustls = { git = "https://github.com/BlackLuny/rustls", rev = "6a0e60cc54ebc9a17cce66b60d59902ab4b38826" }
 ```
 
 For server-only use, the dependency is sufficient.

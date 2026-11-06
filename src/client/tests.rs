@@ -38,9 +38,13 @@ async fn rejects_an_untrusted_decoy_certificate() {
 }
 
 #[tokio::test]
-#[ignore = "V3 server derives its HMAC from the retry marker rather than the final ServerHello"]
 async fn strict_connects_after_hello_retry_request() {
     exercise_tcp(true, false, V3Mode::Strict, Decoy::Tls13WithRetry).await;
+}
+
+#[tokio::test]
+async fn strict_relays_after_hello_retry_request() {
+    exercise_tcp(true, true, V3Mode::Strict, Decoy::Tls13WithRetry).await;
 }
 
 #[tokio::test]
@@ -119,20 +123,27 @@ async fn exercise_tcp(trust_decoy: bool, relay: bool, mode: V3Mode, decoy: Decoy
         };
         let serve_proxy = async {
             let (socket, _) = proxy.accept().await.unwrap();
-            let accepted = server.accept(socket, TcpStream::connect).await;
-            if strict_fallback {
-                assert_eq!(accepted.err().unwrap().kind(), io::ErrorKind::Unsupported);
-            } else if trust_decoy {
-                let (mut stream, mut initial) = accepted.unwrap();
-                assert!(initial.len() <= REQUEST.len());
-                let received = initial.len();
-                initial.resize(REQUEST.len(), 0);
-                stream.read_exact(&mut initial[received..]).await.unwrap();
-                assert_eq!(initial, REQUEST);
-                stream.write_all(RESPONSE).await.unwrap();
-                stream.flush().await.unwrap();
+            if relay {
+                let (transport, mut origin) = tokio::io::duplex(1024);
+                let serve_origin = async move {
+                    respond(&mut origin, Vec::new()).await;
+                    drop(origin);
+                };
+                let ((), result) = tokio::join!(
+                    serve_origin,
+                    server.relay(socket, TcpStream::connect, || async { Ok(transport) }),
+                );
+                result.unwrap();
             } else {
-                assert!(accepted.is_err());
+                let accepted = server.accept(socket, TcpStream::connect).await;
+                if strict_fallback {
+                    assert_eq!(accepted.err().unwrap().kind(), io::ErrorKind::Unsupported);
+                } else if trust_decoy {
+                    let (mut stream, initial) = accepted.unwrap();
+                    respond(&mut stream, initial).await;
+                } else {
+                    assert!(accepted.is_err());
+                }
             }
             let _ = proxy_finished.send(());
         };
@@ -160,6 +171,16 @@ async fn exercise_tcp(trust_decoy: bool, relay: bool, mode: V3Mode, decoy: Decoy
     })
     .await
     .expect("ShadowTLS TCP fixture timed out");
+}
+
+async fn respond(stream: &mut (impl AsyncRead + AsyncWrite + Unpin), mut initial: Vec<u8>) {
+    assert!(initial.len() <= REQUEST.len());
+    let received = initial.len();
+    initial.resize(REQUEST.len(), 0);
+    stream.read_exact(&mut initial[received..]).await.unwrap();
+    assert_eq!(initial, REQUEST);
+    stream.write_all(RESPONSE).await.unwrap();
+    stream.flush().await.unwrap();
 }
 
 async fn exchange(stream: &mut (impl AsyncRead + AsyncWrite + Unpin)) {
