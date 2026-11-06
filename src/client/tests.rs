@@ -1,7 +1,10 @@
 use super::*;
 use crate::{ShadowTlsServer, TlsAddrs};
 use rustls::pki_types::PrivatePkcs8KeyDer;
-use rustls::{version::TLS13, ServerConfig};
+use rustls::{
+    version::{TLS12, TLS13},
+    ServerConfig,
+};
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
@@ -12,38 +15,70 @@ const PASSWORD: &str = "test password";
 const REQUEST: &[u8] = b"authenticated request";
 const RESPONSE: &[u8] = b"authenticated response";
 
+#[derive(Clone, Copy)]
+enum Decoy {
+    Tls13,
+    Tls13WithRetry,
+    Tls12,
+}
+
 #[tokio::test]
 async fn connects_over_tcp_with_verified_client_hello() {
-    exercise_tcp(true, false).await;
+    exercise_tcp(true, false, V3Mode::Strict, Decoy::Tls13).await;
 }
 
 #[tokio::test]
 async fn relays_over_tcp_with_verified_client_hello() {
-    exercise_tcp(true, true).await;
+    exercise_tcp(true, true, V3Mode::Strict, Decoy::Tls13).await;
 }
 
 #[tokio::test]
 async fn rejects_an_untrusted_decoy_certificate() {
-    exercise_tcp(false, false).await;
+    exercise_tcp(false, false, V3Mode::Strict, Decoy::Tls13).await;
 }
 
-async fn exercise_tcp(trust_decoy: bool, relay: bool) {
+#[tokio::test]
+#[ignore = "V3 server derives its HMAC from the retry marker rather than the final ServerHello"]
+async fn strict_connects_after_hello_retry_request() {
+    exercise_tcp(true, false, V3Mode::Strict, Decoy::Tls13WithRetry).await;
+}
+
+#[tokio::test]
+async fn lossy_connects_with_tls12_decoy() {
+    exercise_tcp(true, false, V3Mode::Lossy, Decoy::Tls12).await;
+}
+
+#[tokio::test]
+async fn strict_rejects_a_tls12_decoy() {
+    exercise_tcp(true, false, V3Mode::Strict, Decoy::Tls12).await;
+}
+
+async fn exercise_tcp(trust_decoy: bool, relay: bool, mode: V3Mode, decoy: Decoy) {
     let rcgen::CertifiedKey { cert, signing_key } =
         rcgen::generate_simple_self_signed(vec![NAME.into()]).unwrap();
     let mut roots = RootCertStore::empty();
     if trust_decoy {
         roots.add(cert.der().clone()).unwrap();
     }
-    let mut decoy_config =
-        ServerConfig::builder_with_provider(Arc::new(aws_lc_rs::default_provider()))
-            .with_protocol_versions(&[&TLS13])
-            .unwrap()
-            .with_no_client_auth()
-            .with_single_cert(
-                vec![cert.der().clone()],
-                PrivatePkcs8KeyDer::from(signing_key.serialize_der()).into(),
-            )
-            .unwrap();
+    let mut decoy_provider = aws_lc_rs::default_provider();
+    if matches!(decoy, Decoy::Tls13WithRetry) {
+        // The client initially sends an X25519 share. A P-256-only server must retry.
+        decoy_provider.kx_groups = vec![kx_group::SECP256R1];
+    }
+    let tls_version = match decoy {
+        Decoy::Tls12 => &TLS12,
+        Decoy::Tls13 | Decoy::Tls13WithRetry => &TLS13,
+    };
+    let strict_fallback = mode.strict() && matches!(decoy, Decoy::Tls12);
+    let mut decoy_config = ServerConfig::builder_with_provider(Arc::new(decoy_provider))
+        .with_protocol_versions(&[tls_version])
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![cert.der().clone()],
+            PrivatePkcs8KeyDer::from(signing_key.serialize_der()).into(),
+        )
+        .unwrap();
     decoy_config.alpn_protocols = vec![b"h2".to_vec()];
     decoy_config.send_tls13_tickets = 0;
     let decoy = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -54,14 +89,14 @@ async fn exercise_tcp(trust_decoy: bool, relay: bool) {
         "unused backend".into(),
         TlsAddrs::new(decoy_addr),
         PASSWORD.into(),
-        V3Mode::Strict,
+        mode,
     );
     let client = ShadowTlsClient::new_with_roots(
         proxy_addr.to_string(),
         vec![NAME.into()],
         PASSWORD.into(),
         Some(TlsExtConfig::new(Some(vec![b"h2".to_vec()]))),
-        V3Mode::Strict,
+        mode,
         roots,
     )
     .unwrap();
@@ -74,7 +109,10 @@ async fn exercise_tcp(trust_decoy: bool, relay: bool) {
             if trust_decoy {
                 let tls = handshake.unwrap();
                 assert_eq!(tls.get_ref().1.alpn_protocol(), Some(b"h2".as_slice()));
-                let _ = wait_for_proxy.await;
+                assert_eq!(tls.get_ref().1.protocol_version(), Some(tls_version.version));
+                if !strict_fallback {
+                    let _ = wait_for_proxy.await;
+                }
             } else {
                 assert!(handshake.is_err());
             }
@@ -82,7 +120,9 @@ async fn exercise_tcp(trust_decoy: bool, relay: bool) {
         let serve_proxy = async {
             let (socket, _) = proxy.accept().await.unwrap();
             let accepted = server.accept(socket, TcpStream::connect).await;
-            if trust_decoy {
+            if strict_fallback {
+                assert_eq!(accepted.err().unwrap().kind(), io::ErrorKind::Unsupported);
+            } else if trust_decoy {
                 let (mut stream, mut initial) = accepted.unwrap();
                 assert!(initial.len() <= REQUEST.len());
                 let received = initial.len();
@@ -102,6 +142,11 @@ async fn exercise_tcp(trust_decoy: bool, relay: bool) {
                 let (mut app, transport) = tokio::io::duplex(1024);
                 let ((), result) = tokio::join!(exchange(&mut app), client.relay(transport, socket));
                 result.unwrap();
+            } else if strict_fallback {
+                let Err(error) = client.connect(socket).await else {
+                    panic!("V3 Strict accepted a TLS 1.2 decoy");
+                };
+                assert!(error.to_string().contains("TLS1.3 not supported"), "{error}");
             } else if trust_decoy {
                 exchange(&mut client.connect(socket).await.unwrap()).await;
             } else {
